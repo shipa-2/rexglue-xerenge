@@ -12,6 +12,9 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <mutex>
+#include <set>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -472,11 +475,35 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
   return ev->Set(increment, !!wait);
 }
 
+// Under XERENGE_STUCK_WAIT_SECONDS, note each event the first time it is
+// signalled, by whichever of the several ways a title can signal one. A wait
+// that never returns is either on an event nobody sets or on one whose signal
+// went to another waiter; the set of events ever set, next to the set of events
+// stuck, separates those two without a line per signal.
+void NoteEventSignalled(uint32_t guest_address, const char* how) {
+  static const bool note_events = std::getenv("XERENGE_STUCK_WAIT_SECONDS") != nullptr;
+  if (!note_events || guest_address == 0) {
+    return;
+  }
+  static std::mutex seen_lock;
+  static std::set<uint32_t> seen;
+  bool first = false;
+  {
+    std::lock_guard<std::mutex> guard(seen_lock);
+    first = seen.insert(guest_address).second;
+  }
+  if (first) {
+    REXKRNL_WARN("event first signalled: {:08X} via {}", guest_address, how);
+  }
+}
+
 u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  NoteEventSignalled(event_ptr.guest_address(), "KeSetEvent");
   return xeKeSetEvent(event_ptr, increment, wait);
 }
 
 u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  NoteEventSignalled(event_ptr.guest_address(), "KePulseEvent");
   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
   if (!ev) {
     assert_always();
@@ -544,6 +571,9 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  if (auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle)) {
+    NoteEventSignalled(ev->guest_object(), "NtSetEvent");
+  }
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
@@ -844,6 +874,44 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
   // object_ptr.guest_address(), (uint32_t)wait_reason,
   //(uint32_t)processor_mode, (uint32_t)alertable,
   // timeout_ptr ? (int64_t)timeout : -1);
+  // A wait with no timeout that never returns takes its whole thread with it,
+  // and the thread it took here was the title's main one - the frontend's
+  // update runs the movie player, which waits, and nothing else in the game
+  // advances until it returns. XERENGE_STUCK_WAIT_SECONDS names the object and
+  // the guest caller when that happens, then keeps waiting, so a deadlock says
+  // what it is waiting on instead of looking like a freeze.
+  static const uint32_t stuck_seconds = [] {
+    const char* text = std::getenv("XERENGE_STUCK_WAIT_SECONDS");
+    return text != nullptr ? uint32_t(std::strtoul(text, nullptr, 10)) : 0u;
+  }();
+  if (stuck_seconds != 0 && !timeout_ptr) {
+    uint64_t slice = uint64_t(-int64_t(stuck_seconds) * 10000000);
+    for (uint32_t waited = 0;; waited += stuck_seconds) {
+      uint64_t slice_copy = slice;
+      auto sliced = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
+                                            &slice_copy);
+      if (sliced != X_STATUS_TIMEOUT) {
+        return sliced;
+      }
+      // Which thread, and what kind of object: a dispatcher header's type byte
+      // separates a notification event, which stays signalled, from a
+      // synchronization one, which a single waiter consumes. Getting that
+      // distinction wrong is what deadlocks a player that hands frames between
+      // threads, so name it rather than leaving it to be guessed.
+      // The thread matters more than the object: several worker threads sit on
+      // events for the whole session by design, so a stuck wait is only the
+      // fault when it is the thread that drives the game. The name comes out
+      // empty for these, so report the guest thread id as well.
+      XThread* current = XThread::GetCurrentThread();
+      const uint8_t* header = reinterpret_cast<const uint8_t*>(object_ptr.host_address());
+      REXKRNL_WARN("stuck wait: object {:08X} type {} for {}s on thread {:08X} '{}' (reason {})",
+                   object_ptr.guest_address(), header != nullptr ? header[0] : 0xFF,
+                   waited + stuck_seconds,
+                   current != nullptr ? current->thread_id() : 0,
+                   current != nullptr ? current->name() : std::string("?"),
+                   uint32_t(wait_reason));
+    }
+  }
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
                                         timeout_ptr ? &timeout : nullptr);
   // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);

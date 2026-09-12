@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <chrono>
+#include <thread>
 #include <rex/rex_app.h>
 
 #include <cstdlib>
@@ -507,6 +509,16 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
   REXLOG_INFO("Title terminated; hard-exiting process.");
+  // Flushing can block here, and did: after this message the process sat in
+  // sigsuspend with one thread left and never reached the exit below, so
+  // closing the window left it running. A logger whose worker TerminateTitle
+  // already took down has nothing to drain it. Arm an exit that does not
+  // depend on the flush returning, so the window closing always ends the
+  // process, and let the flush finish first when it can.
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    std::_Exit(0);
+  }).detach();
   rex::FlushLogging();
   std::_Exit(0);
 }

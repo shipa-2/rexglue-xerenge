@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -95,6 +96,19 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/texture_load_rgba16_snorm_float_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_rgba16_unorm_float_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_rgba16_unorm_float_scaled_cs.h"
+
+// The diagnostics this fork adds are off unless XERENGE_GPU_TRACE is set: they
+// report per draw and per swap, which floods a normal session's log.
+static bool XerengeTraceEnabled() {
+  static const bool enabled = std::getenv("XERENGE_GPU_TRACE") != nullptr;
+  return enabled;
+}
+#define REXGPU_TRACE_WARN(...)                    \
+  do {                                            \
+    if (shaders::XerengeTraceEnabled()) {                   \
+      REXGPU_WARN(__VA_ARGS__);                    \
+    }                                              \
+  } while (0)
 }  // namespace shaders
 
 namespace {
@@ -1022,7 +1036,7 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
       last_host_swizzle = host_swizzle;
       last_base = uint32_t(key.base_page);
       last_format = uint32_t(key.format);
-      REXGPU_WARN(
+      REXGPU_TRACE_WARN(
           "swap source: base_page={:X} format={} guest_swizzle={:o} host_swizzle={:o} rb_swap={}",
           uint32_t(key.base_page), uint32_t(key.format), uint32_t(fetch.swizzle), host_swizzle,
           swap_source_needs_rb_swap_out ? *swap_source_needs_rb_swap_out : false);

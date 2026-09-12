@@ -71,6 +71,19 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+// The diagnostics this fork adds are off unless XERENGE_GPU_TRACE is set: they
+// report per draw and per swap, which floods a normal session's log.
+static bool XerengeTraceEnabled() {
+  static const bool enabled = std::getenv("XERENGE_GPU_TRACE") != nullptr;
+  return enabled;
+}
+#define REXGPU_TRACE_WARN(...)                    \
+  do {                                            \
+    if (XerengeTraceEnabled()) {                   \
+      REXGPU_WARN(__VA_ARGS__);                    \
+    }                                              \
+  } while (0)
+
 
 // Diagnostic: REX_FORCE_RB_SWAP=1 builds and uses the red/blue swizzle path
 // even on a device whose image views can swizzle by themselves. It exists to
@@ -2563,7 +2576,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           static bool reported = false;
           if (!reported) {
             reported = true;
-            REXGPU_WARN(
+            REXGPU_TRACE_WARN(
                 "swap gamma: compute={} pwl={} fxaa={} compute_pipeline={} graphics_pipeline={}",
                 use_compute_gamma, use_pwl_gamma_ramp, use_fxaa,
                 swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE,
@@ -3764,7 +3777,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       last_vs = vs_hash;
       last_ps = ps_hash;
       last_mask = interpolator_mask;
-      REXGPU_WARN(
+      REXGPU_TRACE_WARN(
           "shader interface: vs={:016X} ps={:016X} vs_writes={:b} ps_wants={:b} mask={:b} "
           "param_gen_pos={}",
           vs_hash, ps_hash, vertex_shader ? vertex_shader->writes_interpolators() : 0,
@@ -3793,20 +3806,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           uint32_t found = 0;
           for (uint64_t address = 0x82000000u; address < 0x8FF00000u && found < 8; address += 4) {
             if (std::memcmp(membase + address, needle, 4) == 0) {
-              REXGPU_WARN("  0x407F0000 found in guest image at 0x{:08X}", uint32_t(address));
+              REXGPU_TRACE_WARN("  0x407F0000 found in guest image at 0x{:08X}", uint32_t(address));
               ++found;
             }
           }
           for (uint64_t address = 0x40000000u; address < 0x50000000u && found < 16; address += 4) {
             if (std::memcmp(membase + address, needle, 4) == 0) {
-              REXGPU_WARN("  0x407F0000 found in guest heap at 0x{:08X}", uint32_t(address));
+              REXGPU_TRACE_WARN("  0x407F0000 found in guest heap at 0x{:08X}", uint32_t(address));
               ++found;
             }
           }
-          REXGPU_WARN("  guest scan done, {} hits", found);
+          REXGPU_TRACE_WARN("  guest scan done, {} hits", found);
         }
       }
-      REXGPU_WARN("  c0=({},{},{},{}) c1=({},{},{},{}) c2=({},{},{},{})", c(0, 0), c(0, 1),
+      REXGPU_TRACE_WARN("  c0=({},{},{},{}) c1=({},{},{},{}) c2=({},{},{},{})", c(0, 0), c(0, 1),
                   c(0, 2), c(0, 3), c(1, 0), c(1, 1), c(1, 2), c(1, 3), c(2, 0), c(2, 1), c(2, 2),
                   c(2, 3));
     }
@@ -6616,7 +6629,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           for (uint32_t slot = 0; slot < std::min(packed_written, UINT32_C(4)); ++slot) {
             const uint32_t source = packed_sources[slot];
             const uint32_t* from = &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + source * 4];
-            REXGPU_WARN(
+            REXGPU_TRACE_WARN(
                 "vs={:016X} packed slot {} <- c{}: buffer=({},{},{},{}) registers=({},{},{},{})",
                 vs_hash, slot, source, packed[slot * 4 + 0], packed[slot * 4 + 1],
                 packed[slot * 4 + 2], packed[slot * 4 + 3],
