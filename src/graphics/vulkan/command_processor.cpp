@@ -2556,6 +2556,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+        // Diagnostic: whether the gamma pass runs at all, and by which path. A
+        // drastic change to the ramp table left the presented image identical,
+        // so either it is bypassed or it is not reading the table.
+        {
+          static bool reported = false;
+          if (!reported) {
+            reported = true;
+            REXGPU_WARN(
+                "swap gamma: compute={} pwl={} fxaa={} compute_pipeline={} graphics_pipeline={}",
+                use_compute_gamma, use_pwl_gamma_ramp, use_fxaa,
+                swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE,
+                (use_pwl_gamma_ramp ? swap_apply_gamma_pwl_pipeline_
+                                    : swap_apply_gamma_256_entry_table_pipeline_) !=
+                    VK_NULL_HANDLE);
+          }
+        }
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);

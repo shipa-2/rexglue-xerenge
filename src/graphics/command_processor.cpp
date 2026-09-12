@@ -116,11 +116,27 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
 CommandProcessor::~CommandProcessor() = default;
 
 bool CommandProcessor::Initialize() {
-  // Initialize the gamma ramps to their default (linear) values - taken from
-  // what games set when starting with the sRGB (return value 1)
-  // VdGetCurrentDisplayGamma.
+  // Initialize the gamma ramps. A title that programs its own ramp overwrites
+  // this; one that never does is relying on what the console put there, and
+  // that is not a linear ramp.
+  //
+  // On the 360 the system reshapes an application's ramp before uploading it to
+  // the scanout LUT, and for a TV-gamma display the hardware curve ends up as
+  // Rec709_encode(sRGB_decode(ramp)). Emulators that leave the LUT linear
+  // therefore display an uncorrected front buffer, which reads as too bright
+  // and washed out - the curve darkens, most of all in the low end. Seeding the
+  // default with the corrected curve puts the untouched case where the hardware
+  // would have had it. x360_display_gamma turns it off for comparison.
+  const bool display_correction = REXCVAR_GET(x360_display_gamma);
   for (uint32_t i = 0; i < 256; ++i) {
-    uint32_t value = i * 0x3FF / 0xFF;
+    double level = double(i) / 255.0;
+    if (display_correction) {
+      const double linear = level <= 0.04045 ? level / 12.92
+                                             : std::pow((level + 0.055) / 1.055, 2.4);
+      level = linear < 0.018 ? linear * 4.5 : 1.099 * std::pow(linear, 0.45) - 0.099;
+      level = std::clamp(level, 0.0, 1.0);
+    }
+    uint32_t value = uint32_t(std::lround(level * 1023.0));
     reg::DC_LUT_30_COLOR& gamma_ramp_entry = gamma_ramp_256_entry_table_[i];
     gamma_ramp_entry.color_10_blue = value;
     gamma_ramp_entry.color_10_green = value;

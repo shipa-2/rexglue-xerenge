@@ -25,6 +25,12 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
+REXCVAR_DEFINE_BOOL(x360_display_gamma, true, "GPU",
+                    "Seed the default scanout gamma ramp with the console's display correction "
+                    "curve, Rec709_encode(sRGB_decode(x)), instead of a linear ramp. The 360's "
+                    "system software reshapes a title's ramp this way before uploading it, so a "
+                    "title that never programs one relies on it; leaving the ramp linear reads as "
+                    "too bright and washed out.");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");
