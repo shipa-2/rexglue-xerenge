@@ -3803,6 +3803,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           uint8_t* const membase = memory_->virtual_membase();
           // The guest stores big-endian, so look for the bytes in that order.
           const uint8_t needle[4] = {0x40, 0x7F, 0x00, 0x00};
+          // The ring first: the constant reaches the GPU inside a packet the
+          // title assembles by hand, so the ring is where that packet lives and
+          // the only place the write can be watched from. Addresses here are
+          // stable because the arena is mapped at a fixed base.
+          for (uint64_t address = 0x07AF7000u; address < 0x07B07000u; address += 4) {
+            if (std::memcmp(membase + address, needle, 4) == 0) {
+              REXGPU_TRACE_WARN("  0x407F0000 found in the command ring at 0x{:08X} (host {})",
+                                uint32_t(address),
+                                static_cast<const void*>(membase + address));
+            }
+          }
           uint32_t found = 0;
           for (uint64_t address = 0x82000000u; address < 0x8FF00000u && found < 8; address += 4) {
             if (std::memcmp(membase + address, needle, 4) == 0) {

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -731,8 +732,32 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
   for (uint32_t m = 0; m < count; m++) {
+    const uintptr_t source = reader->read_ptr();
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+    // Where a shader constant physically came from. The title assembles its
+    // packets by hand, so there is no call to intercept and the value cannot be
+    // found by searching memory for its bit pattern - that pattern also occurs
+    // as an ordinary fence value. Reporting the address the packet was read
+    // from gives the one place a watchpoint will catch the code that wrote it.
+    static const uint32_t watched_register = [] {
+      const char* text = std::getenv("XERENGE_WATCH_CONSTANT_REGISTER");
+      return text != nullptr ? uint32_t(std::strtoul(text, nullptr, 0)) : 0u;
+    }();
+    static const uint32_t watched_value = [] {
+      const char* text = std::getenv("XERENGE_WATCH_CONSTANT_VALUE");
+      return text != nullptr ? uint32_t(std::strtoul(text, nullptr, 0)) : 0u;
+    }();
+    if (watched_register != 0 && target_index == watched_register &&
+        (watched_value == 0 || reg_data == watched_value)) {
+      static uint32_t reported = 0;
+      if (reported < 8) {
+        ++reported;
+        REXGPU_WARN("constant register {:04X} = {:08X} read from host {} (packet at offset {:X})",
+                    target_index, reg_data, reinterpret_cast<const void*>(source),
+                    reader->read_offset());
+      }
+    }
     WriteRegister(target_index, reg_data);
   }
 
