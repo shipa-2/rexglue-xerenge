@@ -281,6 +281,10 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
 }
 
 void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  // Worth reporting: a title that writes its command packets by hand rather
+  // than through the D3D entry points leaves no API to intercept, and the ring
+  // is then the only place a particular packet can be found and watched.
+  REXGPU_INFO("InitializeRingBuffer({:08X}, size_log2 {})", ptr, size_log2);
   command_processor_->InitializeRingBuffer(ptr, size_log2);
 }
 
