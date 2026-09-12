@@ -159,20 +159,16 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
 
-  // Late-phase logging
-  std::string log_file_cvar = REXCVAR_GET(log_file);
   std::string log_level_str = REXCVAR_GET(log_level);
   if (REXCVAR_GET(log_verbose) && log_level_str == "info")
     log_level_str = "trace";
 
-  auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
-  auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
-                                        log_level_str, category_levels);
-  if (log_file_cvar.empty()) {
-    log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
-  }
-
+  auto log_config =
+      rex::BuildLogConfig(log_level_str, rex::ParseCategoryLevelsFromConfig(config_path_));
+  log_config.app_name = std::string(GetName());
+  log_config.log_dir = exe_dir / "logs";
+  OnConfigureLogging(log_config);
+  rex::ApplyLogCvarOverrides(log_config);
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();
 
@@ -336,7 +332,7 @@ bool ReXApp::SetupPresentation() {
   }
 
   // Create window
-  window_ = rex::ui::Window::Create(app_context(), GetName(), 1280, 720);
+  window_ = rex::ui::Window::Create(app_context(), GetName());
   if (!window_) {
     REXLOG_ERROR("Failed to create window");
     return false;

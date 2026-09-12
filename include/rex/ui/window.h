@@ -153,9 +153,7 @@ class Window {
   };
 
   static std::unique_ptr<Window> Create(WindowedAppContext& app_context,
-                                        const std::string_view title,
-                                        uint32_t desired_logical_width,
-                                        uint32_t desired_logical_height);
+                                        const std::string_view title);
 
   virtual ~Window();
 
@@ -268,6 +266,12 @@ class Window {
   }
   uint32_t GetActualLogicalWidth() const { return SizeToLogical(GetActualPhysicalWidth()); }
   uint32_t GetActualLogicalHeight() const { return SizeToLogical(GetActualPhysicalHeight()); }
+
+  virtual bool GetDisplayPixelSize(uint32_t& width, uint32_t& height) const {
+    (void)width;
+    (void)height;
+    return false;
+  }
 
   // Desired state stored by the common Window, modifiable both externally and
   // by the implementation (including from SetFullscreen itself).

@@ -44,40 +44,14 @@ namespace rex::ui {
 
 namespace {
 
-uint32_t ResolveWindowWidth(uint32_t requested_width) {
-  if (REXCVAR_GET(window_width) > 0) {
-    return uint32_t(REXCVAR_GET(window_width));
+void ResolveWindowSize(uint32_t& width, uint32_t& height) {
+  int32_t configured_width = REXCVAR_GET(window_width);
+  int32_t configured_height = REXCVAR_GET(window_height);
+  if (configured_width <= 0 || configured_height <= 0) {
+    rex::graphics::video_mode_util::ResolveConfiguredSize(configured_width, configured_height);
   }
-  if (!rex::cvar::HasNonDefaultValue("window_width")) {
-    if (rex::cvar::HasNonDefaultValue("video_mode_width") && REXCVAR_GET(video_mode_width) > 0) {
-      return uint32_t(std::clamp(REXCVAR_GET(video_mode_width), 1, 8192));
-    }
-    int32_t preset_width = 0;
-    int32_t preset_height = 0;
-    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
-                                                                       preset_height)) {
-      return uint32_t(std::clamp(preset_width, 1, 8192));
-    }
-  }
-  return requested_width;
-}
-
-uint32_t ResolveWindowHeight(uint32_t requested_height) {
-  if (REXCVAR_GET(window_height) > 0) {
-    return uint32_t(REXCVAR_GET(window_height));
-  }
-  if (!rex::cvar::HasNonDefaultValue("window_height")) {
-    if (rex::cvar::HasNonDefaultValue("video_mode_height") && REXCVAR_GET(video_mode_height) > 0) {
-      return uint32_t(std::clamp(REXCVAR_GET(video_mode_height), 1, 8192));
-    }
-    int32_t preset_width = 0;
-    int32_t preset_height = 0;
-    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
-                                                                       preset_height)) {
-      return uint32_t(std::clamp(preset_height, 1, 8192));
-    }
-  }
-  return requested_height;
+  width = uint32_t(std::clamp(configured_width, 1, 8192));
+  height = uint32_t(std::clamp(configured_height, 1, 8192));
 }
 
 // SDL timer callback (runs on SDL's timer thread): defer the actual hide to
@@ -116,12 +90,11 @@ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
 }  // namespace
 
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
-                                       const std::string_view title, uint32_t desired_logical_width,
-                                       uint32_t desired_logical_height) {
-  desired_logical_width = ResolveWindowWidth(desired_logical_width);
-  desired_logical_height = ResolveWindowHeight(desired_logical_height);
-  return std::make_unique<WindowSDL>(app_context, title, desired_logical_width,
-                                     desired_logical_height);
+                                       const std::string_view title) {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  ResolveWindowSize(width, height);
+  return std::make_unique<WindowSDL>(app_context, title, width, height);
 }
 
 WindowSDL::WindowSDL(WindowedAppContext& app_context, const std::string_view title,
@@ -275,6 +248,19 @@ bool WindowSDL::WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {
   x_out = int32_t(center_x * density);
   y_out = int32_t(center_y * density);
   return true;
+}
+
+bool WindowSDL::GetDisplayPixelSize(uint32_t& width, uint32_t& height) const {
+  if (!sdl_window_) {
+    return false;
+  }
+  const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(sdl_window_));
+  if (!mode) {
+    return false;
+  }
+  width = uint32_t(float(mode->w) * mode->pixel_density);
+  height = uint32_t(float(mode->h) * mode->pixel_density);
+  return width > 0 && height > 0;
 }
 
 float WindowSDL::GetPixelDensity() const {
