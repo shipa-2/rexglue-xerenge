@@ -416,6 +416,18 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                         rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
+          // Diagnostic: whether the title programs the scanout gamma ramp at
+          // all, and what it puts there. Left unprogrammed the default is
+          // linear, which is not what the console would be doing.
+          static uint32_t writes = 0;
+          if ((writes++ % 512) == 0) {
+            const reg::DC_LUT_30_COLOR& written =
+                gamma_ramp_256_entry_table_[gamma_ramp_rw_index.rw_index];
+            REXGPU_WARN("gamma ramp write #{}: index={} rgb=({},{},{}) of 1023", writes,
+                        uint32_t(gamma_ramp_rw_index.rw_index),
+                        uint32_t(written.color_10_red), uint32_t(written.color_10_green),
+                        uint32_t(written.color_10_blue));
+          }
           OnGammaRamp256EntryTableValueWritten();
         }
       } break;

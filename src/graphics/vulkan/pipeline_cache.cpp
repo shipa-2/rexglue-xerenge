@@ -1246,6 +1246,14 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     return false;
   }
 
+  // Dump the translated shader when asked, as the D3D12 path already does.
+  // Without this only the guest microcode can be dumped, which says nothing
+  // about how the translation wired the shader interface up.
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders),
+                     shader.type() == xenos::ShaderType::kPixel ? "spirv_ps" : "spirv_vs");
+  }
+
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
 

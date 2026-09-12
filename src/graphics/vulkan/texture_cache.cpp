@@ -1008,6 +1008,26 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
         swizzle_component(host_swizzle, 1) == xenos::XE_GPU_TEXTURE_SWIZZLE_G &&
         swizzle_component(host_swizzle, 2) == xenos::XE_GPU_TEXTURE_SWIZZLE_R;
   }
+  // Diagnostic: the channel order of the whole presented frame is decided here,
+  // from texture fetch constant 0 as it stands at the moment of the swap. If
+  // that decision is not stable the presented image changes channel order
+  // between frames or between runs, which is what a colour cast that moves from
+  // one set of textures to another looks like.
+  {
+    static uint32_t last_guest_swizzle = ~0u, last_host_swizzle = ~0u;
+    static uint32_t last_base = ~0u, last_format = ~0u;
+    if (uint32_t(fetch.swizzle) != last_guest_swizzle || host_swizzle != last_host_swizzle ||
+        uint32_t(key.base_page) != last_base || uint32_t(key.format) != last_format) {
+      last_guest_swizzle = uint32_t(fetch.swizzle);
+      last_host_swizzle = host_swizzle;
+      last_base = uint32_t(key.base_page);
+      last_format = uint32_t(key.format);
+      REXGPU_WARN(
+          "swap source: base_page={:X} format={} guest_swizzle={:o} host_swizzle={:o} rb_swap={}",
+          uint32_t(key.base_page), uint32_t(key.format), uint32_t(fetch.swizzle), host_swizzle,
+          swap_source_needs_rb_swap_out ? *swap_source_needs_rb_swap_out : false);
+    }
+  }
   VkImageView texture_view = texture->GetView(false, host_swizzle, false);
   if (texture_view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;

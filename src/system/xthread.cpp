@@ -1449,6 +1449,17 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // Seed the host floating-point policy, exactly as XThread::Execute does for
+  // a guest entry point. A host thread runs guest code too - the audio worker
+  // reaches the XMA registers through the function dispatcher - and the guest's
+  // first rounding-mode update writes this context's cached csr into MXCSR.
+  // Left unseeded that word is zero, which clears every exception mask, so the
+  // next inexact result anywhere on this thread raises SIGFPE: FFmpeg's MDCT
+  // setup divides 1 by 2*pi while opening the decoder and the process dies.
+  if (auto* ctx = thread_state_ ? thread_state_->context() : nullptr) {
+    ctx->fpscr.InitHost();
+  }
+
   int ret = host_fn_();
 
   // Exit.

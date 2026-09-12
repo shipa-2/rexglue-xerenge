@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -70,6 +71,16 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+// Diagnostic: REX_FORCE_RB_SWAP=1 builds and uses the red/blue swizzle path
+// even on a device whose image views can swizzle by themselves. It exists to
+// settle by experiment whether a title's presented image has its red and blue
+// exchanged, which reasoning about the swizzle chain alone cannot answer.
+static bool ForceRbSwap() {
+  static const bool forced = std::getenv("REX_FORCE_RB_SWAP") != nullptr;
+  return forced;
+}
+
 
 namespace {
 
@@ -184,6 +195,10 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
 
 const char* GetSwapFxaaComputeSource(bool extreme_quality) {
   return extreme_quality ? R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -254,6 +269,10 @@ void main() {
 }
 )"
                          : R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -327,6 +346,10 @@ void main() {
 
 const char* GetSwapApplyGammaTablePixelRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(set = 0, binding = 0) uniform textureBuffer xe_apply_gamma_ramp;
 layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;
 
@@ -346,6 +369,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlPixelRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(set = 0, binding = 0) uniform utextureBuffer xe_apply_gamma_ramp;
 layout(set = 1, binding = 0) uniform texture2D xe_apply_gamma_source;
 
@@ -372,6 +399,10 @@ void main() {
 
 const char* GetSwapApplyGammaTableComputeRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -400,6 +431,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlComputeRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -433,6 +468,10 @@ void main() {
 
 const char* GetSwapApplyGammaTableFxaaLumaComputeRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -462,6 +501,10 @@ void main() {
 
 const char* GetSwapApplyGammaPwlFxaaLumaComputeRbSwapSource() {
   return R"(#version 450
+// texelFetch on a sampler-less texture needs this extension declared, or
+// glslang refuses the shader and the red/blue fallback silently does not
+// exist - which is how it was: all six of these failed to compile.
+#extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform XeApplyGammaRampConstants {
@@ -1725,7 +1768,7 @@ bool VulkanCommandProcessor::SetupContext() {
         device, VK_NULL_HANDLE, 1, &swap_apply_gamma_pipeline_create_info, nullptr,
         swap_apply_gamma_pipelines[i]);
   }
-  if (!vulkan_device->properties().imageViewFormatSwizzle) {
+  if (!vulkan_device->properties().imageViewFormatSwizzle || ForceRbSwap()) {
     auto create_rb_swap_pipeline = [&](const char* source, VkPipeline& pipeline_out,
                                        const char* pipeline_name) {
       std::vector<uint32_t> pixel_spirv;
@@ -1800,7 +1843,7 @@ bool VulkanCommandProcessor::SetupContext() {
         "Failed to create the PWL gamma ramp application compute pipeline with "
         "luma output");
   }
-  if (!vulkan_device->properties().imageViewFormatSwizzle) {
+  if (!vulkan_device->properties().imageViewFormatSwizzle || ForceRbSwap()) {
     auto create_rb_swap_compute_pipeline = [&](const char* source, VkPipeline& pipeline_out,
                                                const char* pipeline_name) {
       std::vector<uint32_t> compute_spirv;
@@ -2440,7 +2483,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
         bool swap_source_requires_compute_rb_swap =
-            !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap;
+            (!vulkan_device->properties().imageViewFormatSwizzle || ForceRbSwap()) &&
+            (swap_source_needs_rb_swap || ForceRbSwap());
         auto select_swap_apply_gamma_compute_pipeline = [&](bool use_pwl,
                                                             bool use_fxaa_luma) -> VkPipeline {
           if (use_pwl) {
@@ -2876,7 +2920,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkPipeline swap_apply_gamma_pipeline = use_pwl_gamma_ramp
                                                      ? swap_apply_gamma_pwl_pipeline_
                                                      : swap_apply_gamma_256_entry_table_pipeline_;
-          if (!vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap) {
+          if ((!vulkan_device->properties().imageViewFormatSwizzle || ForceRbSwap()) &&
+              (swap_source_needs_rb_swap || ForceRbSwap())) {
             VkPipeline swap_apply_gamma_rb_swap_pipeline =
                 use_pwl_gamma_ramp ? swap_apply_gamma_pwl_rb_swap_pipeline_
                                    : swap_apply_gamma_256_entry_table_rb_swap_pipeline_;
@@ -3688,6 +3733,68 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                              regs.Get<reg::SQ_CONTEXT_MISC>(),
                                                              ps_param_gen_pos))
                    : 0;
+
+  // Diagnostic: the interface between the two shaders. The title's UI pixel
+  // shader is "sample tf0 into r0, then multiply by r1", and its vertex shader
+  // passes float constant c2 out as interpolator 1 - that constant is the tint
+  // and the dimming of unselected items. If interpolator 1 is missing from this
+  // mask, r1 never arrives and the UI renders unmodulated.
+  {
+    static uint64_t last_vs = 0, last_ps = 0;
+    static uint32_t last_mask = ~0u;
+    const uint64_t vs_hash = vertex_shader ? vertex_shader->ucode_data_hash() : 0;
+    const uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    if (vs_hash != last_vs || ps_hash != last_ps || interpolator_mask != last_mask) {
+      last_vs = vs_hash;
+      last_ps = ps_hash;
+      last_mask = interpolator_mask;
+      REXGPU_WARN(
+          "shader interface: vs={:016X} ps={:016X} vs_writes={:b} ps_wants={:b} mask={:b} "
+          "param_gen_pos={}",
+          vs_hash, ps_hash, vertex_shader ? vertex_shader->writes_interpolators() : 0,
+          pixel_shader ? pixel_shader->GetInterpolatorInputMask(
+                             regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(),
+                             ps_param_gen_pos)
+                       : 0,
+          interpolator_mask, ps_param_gen_pos);
+      // The tint itself. c2 is what the UI vertex shader passes out as the
+      // colour the pixel shader multiplies by, so its value decides both the
+      // hue and how dim an unselected item is drawn.
+      const uint32_t c_base = XE_GPU_REG_SHADER_CONSTANT_000_X;
+      auto c = [&](uint32_t index, uint32_t component) {
+        return rex::memory::Reinterpret<float>(regs[c_base + index * 4 + component]);
+      };
+      // Where the wrong value lives in the guest's own memory. The arena is
+      // mapped at a fixed virtual base, so an address found here is stable
+      // across runs and can be watched to catch the code that writes it.
+      if (regs[c_base + 2 * 4 + 2] == 0x407F0000u) {
+        static bool scanned = false;
+        if (!scanned) {
+          scanned = true;
+          uint8_t* const membase = memory_->virtual_membase();
+          // The guest stores big-endian, so look for the bytes in that order.
+          const uint8_t needle[4] = {0x40, 0x7F, 0x00, 0x00};
+          uint32_t found = 0;
+          for (uint64_t address = 0x82000000u; address < 0x8FF00000u && found < 8; address += 4) {
+            if (std::memcmp(membase + address, needle, 4) == 0) {
+              REXGPU_WARN("  0x407F0000 found in guest image at 0x{:08X}", uint32_t(address));
+              ++found;
+            }
+          }
+          for (uint64_t address = 0x40000000u; address < 0x50000000u && found < 16; address += 4) {
+            if (std::memcmp(membase + address, needle, 4) == 0) {
+              REXGPU_WARN("  0x407F0000 found in guest heap at 0x{:08X}", uint32_t(address));
+              ++found;
+            }
+          }
+          REXGPU_WARN("  guest scan done, {} hits", found);
+        }
+      }
+      REXGPU_WARN("  c0=({},{},{},{}) c1=({},{},{},{}) c2=({},{},{},{})", c(0, 0), c(0, 1),
+                  c(0, 2), c(0, 3), c(1, 0), c(1, 1), c(1, 2), c(1, 3), c(2, 0), c(2, 1), c(2, 2),
+                  c(2, 3));
+    }
+  }
 
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
@@ -6458,16 +6565,48 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
+      // Diagnostic: what the shader will actually read, next to where it came
+      // from. The vertex shader reads its constants by tightly packed index, so
+      // the buffer only holds the ones the shader declared; comparing the two
+      // is the only way to tell a shader that reads the wrong slot from a
+      // register file that holds the wrong value.
+      uint8_t* const float_constants_base = mapping;
+      uint32_t packed_sources[8];
+      uint32_t packed_written = 0;
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
         uint32_t float_constant_index;
         while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
           float_constant_map_entry &= ~(1ull << float_constant_index);
+          if (packed_written < 8) {
+            packed_sources[packed_written] = (i << 6) + float_constant_index;
+          }
+          ++packed_written;
           std::memcpy(
               mapping,
               &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
               sizeof(float) * 4);
           mapping += sizeof(float) * 4;
+        }
+      }
+      {
+        static uint64_t last_vs_hash = 0;
+        const uint64_t vs_hash = vertex_shader->ucode_data_hash();
+        static uint32_t reports = 0;
+        if (vs_hash != last_vs_hash || reports < 24) {
+          last_vs_hash = vs_hash;
+          ++reports;
+          const float* packed = reinterpret_cast<const float*>(float_constants_base);
+          for (uint32_t slot = 0; slot < std::min(packed_written, UINT32_C(4)); ++slot) {
+            const uint32_t source = packed_sources[slot];
+            const uint32_t* from = &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + source * 4];
+            REXGPU_WARN(
+                "vs={:016X} packed slot {} <- c{}: buffer=({},{},{},{}) registers=({},{},{},{})",
+                vs_hash, slot, source, packed[slot * 4 + 0], packed[slot * 4 + 1],
+                packed[slot * 4 + 2], packed[slot * 4 + 3],
+                rex::memory::Reinterpret<float>(from[0]), rex::memory::Reinterpret<float>(from[1]),
+                rex::memory::Reinterpret<float>(from[2]), rex::memory::Reinterpret<float>(from[3]));
+          }
         }
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
