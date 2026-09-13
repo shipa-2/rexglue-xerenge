@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -393,6 +395,57 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
 
   return f32;
 }
+
+namespace {
+// XERENGE_SHADER_PROBE, parsed once: "5.x" puts register 5's x component on the
+// screen in place of the colour a pixel shader computes.
+struct ShaderProbe {
+  bool active = false;
+  // Up to three registers at once, one per colour channel, so a single run
+  // answers three questions instead of one.
+  uint32_t count = 0;
+  uint32_t register_index[3] = {};
+  uint32_t component[3] = {};
+  // Probing every shader makes the game unnavigable - menus and all. Limiting
+  // it to shaders that bind at least this many textures leaves the interface
+  // alone and still covers the ones worth looking at: a car body binds eight,
+  // an interface quad one.
+  uint32_t least_textures = 0;
+};
+const ShaderProbe& XeShaderProbe() {
+  static const ShaderProbe probe = [] {
+    ShaderProbe parsed;
+    const char* text = std::getenv("XERENGE_SHADER_PROBE");
+    if (text == nullptr) {
+      return parsed;
+    }
+    const char* at = text;
+    while (*at != '\0' && parsed.count < 3) {
+      char* end = nullptr;
+      parsed.register_index[parsed.count] = uint32_t(std::strtoul(at, &end, 10));
+      uint32_t component = 0;
+      if (end != nullptr && *end == '.') {
+        const char letter = end[1];
+        component = letter == 'y' ? 1 : letter == 'z' ? 2 : letter == 'w' ? 3 : 0;
+        end += 2;
+      }
+      parsed.component[parsed.count] = component;
+      ++parsed.count;
+      at = (end != nullptr && *end == ',') ? end + 1 : "";
+    }
+    if (parsed.count == 0) {
+      return parsed;
+    }
+    const char* least = std::getenv("XERENGE_SHADER_PROBE_TEXTURES");
+    if (least != nullptr) {
+      parsed.least_textures = uint32_t(std::strtoul(least, nullptr, 10));
+    }
+    parsed.active = true;
+    return parsed;
+  }();
+  return probe;
+}
+}  // namespace
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   // Loaded if needed.
@@ -921,6 +974,42 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
       spv::Id color_variable = output_or_var_fragment_data_[color_target_index];
       spv::Id color = builder_->createLoad(color_variable, spv::NoPrecision);
+
+      // XERENGE_SHADER_PROBE=<register>.<component> replaces what a pixel
+      // shader writes with one of its own registers, spread across the colour.
+      // A long shader's inputs and its output are both visible in a capture,
+      // but nothing in between is, and RenderDoc's Vulkan replay will not step
+      // these shaders. Putting a register on the screen shows where a value
+      // goes wrong, over the whole picture at once.
+      if (is_pixel_shader() && XeShaderProbe().active && color_target_index == 0 &&
+          var_main_registers_ != spv::NoResult &&
+          current_shader().texture_bindings().size() >= XeShaderProbe().least_textures) {
+        spv::Id channels[3] = {};
+        bool usable = true;
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+          const uint32_t which = std::min(channel, XeShaderProbe().count - 1);
+          if (XeShaderProbe().register_index[which] >= register_count()) {
+            usable = false;
+            break;
+          }
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(
+              builder_->makeIntConstant(int(XeShaderProbe().register_index[which])));
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(XeShaderProbe().component[which])));
+          channels[channel] = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+        }
+        if (usable) {
+          id_vector_temp_.clear();
+          for (int at = 0; at < 3; ++at) {
+            id_vector_temp_.push_back(channels[at]);
+          }
+          id_vector_temp_.push_back(builder_->makeFloatConstant(1.0f));
+          color = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+        }
+      }
 
       // Apply the exponent bias after the alpha test and alpha to coverage
       // because they need the unbiased alpha from the shader.

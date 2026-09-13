@@ -2029,11 +2029,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // Apply the exponent bias, which is bits 13:18 of word 3 - not of word
+        // 4, whose bits 12:21 are the LOD bias. The two overlap, so taking the
+        // exponent from word 4 turns an ordinary negative LOD bias into a
+        // division: Burnout Revenge fetches its car paint with a LOD bias of
+        // -0.5, which read this way became 2^-8 and rendered every car body
+        // black.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                            id_vector_temp_),
+                spv::NoPrecision));
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
