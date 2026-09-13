@@ -1098,14 +1098,25 @@ bool build_vpkuhus(BuilderContext& ctx) {
   // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
   // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
   // instead of 0xFF.
+  // NOTE(xerenge): the destination is very often one of the sources - titles
+  // write vpkuhus vD,vD,vD to narrow a vector in place. Writing the bytes
+  // straight into the destination destroys halfwords that have not been read
+  // yet: byte 15 is the upper half of halfword 7, so the second read of that
+  // halfword sees a value built from a byte already written, which then
+  // saturates to 0xFF. Read both sources out first.
+  ctx.println("\t{{");
+  ctx.println("\t\tuint16_t xe_pack_a[8], xe_pack_b[8];");
+  ctx.println("\t\tfor (int xe_i = 0; xe_i < 8; ++xe_i) {{");
+  ctx.println("\t\t\txe_pack_a[xe_i] = {}.u16[xe_i];", ctx.v(ctx.insn.operands[1]));
+  ctx.println("\t\t\txe_pack_b[xe_i] = {}.u16[xe_i];", ctx.v(ctx.insn.operands[2]));
+  ctx.println("\t\t}}");
   for (size_t i = 0; i < 8; i++) {
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
-                ctx.v(ctx.insn.operands[1]), 7 - i);
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
-                ctx.v(ctx.insn.operands[2]), 7 - i);
+    ctx.println("\t\t{}.u8[{}] = xe_pack_a[{}] > 0xFF ? 0xFF : (uint8_t)xe_pack_a[{}];",
+                ctx.v(ctx.insn.operands[0]), 15 - i, 7 - i, 7 - i);
+    ctx.println("\t\t{}.u8[{}] = xe_pack_b[{}] > 0xFF ? 0xFF : (uint8_t)xe_pack_b[{}];",
+                ctx.v(ctx.insn.operands[0]), 7 - i, 7 - i, 7 - i);
   }
+  ctx.println("\t}}");
   return true;
 }
 
@@ -1126,14 +1137,21 @@ bool build_vpkuwus(BuilderContext& ctx) {
 
   // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
   // Saturate each u32 to [0, 0xFFFF], then pack to u16
+  // Same hazard as vpkuhus: the destination is commonly one of the sources, and
+  // the halfwords written land on words still to be read.
+  ctx.println("\t{{");
+  ctx.println("\t\tuint32_t xe_pack_a[4], xe_pack_b[4];");
+  ctx.println("\t\tfor (int xe_i = 0; xe_i < 4; ++xe_i) {{");
+  ctx.println("\t\t\txe_pack_a[xe_i] = {}.u32[xe_i];", ctx.v(ctx.insn.operands[1]));
+  ctx.println("\t\t\txe_pack_b[xe_i] = {}.u32[xe_i];", ctx.v(ctx.insn.operands[2]));
+  ctx.println("\t\t}}");
   for (size_t i = 0; i < 4; i++) {
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
-                ctx.v(ctx.insn.operands[1]), 3 - i);
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
-                ctx.v(ctx.insn.operands[2]), 3 - i);
+    ctx.println("\t\t{}.u16[{}] = xe_pack_a[{}] > 0xFFFF ? 0xFFFF : (uint16_t)xe_pack_a[{}];",
+                ctx.v(ctx.insn.operands[0]), 7 - i, 3 - i, 3 - i);
+    ctx.println("\t\t{}.u16[{}] = xe_pack_b[{}] > 0xFFFF ? 0xFFFF : (uint16_t)xe_pack_b[{}];",
+                ctx.v(ctx.insn.operands[0]), 3 - i, 3 - i, 3 - i);
   }
+  ctx.println("\t}}");
   return true;
 }
 
