@@ -10,6 +10,12 @@
  */
 
 #include <algorithm>
+#include <string_view>
+#include <map>
+#include <cstring>
+#include <set>
+#include <mutex>
+#include <cstdlib>
 #include <cmath>
 
 #include <rex/assert.h>
@@ -762,6 +768,21 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
     {"Resolve Copy Full 128bpp", true, 2, 4, 4, 3},
 };
 
+namespace {
+bool XeReflectTraceEnabled() {
+  static const bool enabled = std::getenv("XERENGE_REFLECT_TRACE") != nullptr;
+  return enabled;
+}
+
+bool XeResolveSwapFlipEnabled() {
+  static const bool enabled = [] {
+    const char* text = std::getenv("XERENGE_RESOLVE_SWAP");
+    return text != nullptr && std::string_view(text) == "flip";
+  }();
+  return enabled;
+}
+}  // namespace
+
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
@@ -1093,9 +1114,82 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     info_out.copy_dest_info.copy_dest_swap = false;
   }
 
+  // XERENGE_RESOLVE_SWAP=flip inverts the red/blue swap flag for resolves that
+  // take the full path. The reflection map the cars are lit by comes back with
+  // those channels exchanged; it is resolved by that path, while the frame
+  // itself takes the fast one and comes out right. Flipping the flag says which
+  // it is: if the map's colour changes, the flag is honoured and something else
+  // exchanges the channels; if nothing changes, the full path ignores it.
+  if (XeResolveSwapFlipEnabled() && !is_depth) {
+    const bool takes_fast_path =
+        !info_out.copy_dest_info.copy_dest_exp_bias &&
+        xenos::IsSingleCopySampleSelected(info_out.copy_dest_coordinate_info.copy_sample_select) &&
+        xenos::IsColorResolveFormatBitwiseEquivalent(
+            xenos::ColorRenderTargetFormat(color_edram_info.format),
+            xenos::ColorFormat(info_out.copy_dest_info.copy_dest_format));
+    if (!takes_fast_path) {
+      info_out.copy_dest_info.copy_dest_swap = !info_out.copy_dest_info.copy_dest_swap;
+    }
+  }
+
   info_out.rb_depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR];
   info_out.rb_color_clear = regs[XE_GPU_REG_RB_COLOR_CLEAR];
   info_out.rb_color_clear_lo = regs[XE_GPU_REG_RB_COLOR_CLEAR_LO];
+
+  // XERENGE_REFLECT_TRACE: the cars are lit by a small texture the title
+  // renders itself and resolves to memory, and it comes back with red and blue
+  // exchanged and about three times too dark. These are the fields that decide
+  // both: the swap flag, the byte order, the destination format and the
+  // exponent bias. Reported once per distinct resolve so the interesting small
+  // ones are not buried under the full-screen ones.
+  // XERENGE_REFLECT_TRACE: the cars are lit by a small texture the title
+  // renders itself and resolves to memory, and it comes back with red and blue
+  // exchanged. These are the fields that decide the channel order on the
+  // writing side - the swap flag, the byte order, the destination format - put
+  // beside the bytes a previous pass actually left in memory, which is what the
+  // texture cache reads back.
+  if (XeReflectTraceEnabled()) {
+    static std::mutex resolve_mutex;
+    static std::map<uint64_t, uint32_t> seen;
+    // The destination moves from frame to frame, so the address this resolve is
+    // about to write has never been touched; the previous one has.
+    static std::map<uint64_t, uint32_t> previous_destination;
+    const uint32_t width = x1 - x0, height = y1 - y0;
+    const uint64_t signature = (uint64_t(width) << 48) | (uint64_t(height) << 32) |
+                               (uint64_t(info_out.copy_dest_info.copy_dest_format) << 8) |
+                               uint64_t(info_out.copy_dest_info.copy_dest_swap);
+    std::lock_guard<std::mutex> lock(resolve_mutex);
+    if (++seen[signature] == 8) {
+      const bool bitwise_equivalent = xenos::IsColorResolveFormatBitwiseEquivalent(
+          xenos::ColorRenderTargetFormat(color_edram_info.format),
+          xenos::ColorFormat(info_out.copy_dest_info.copy_dest_format));
+      const bool single_sample = xenos::IsSingleCopySampleSelected(
+          info_out.copy_dest_coordinate_info.copy_sample_select);
+      const bool takes_fast_path =
+          is_depth || (!info_out.copy_dest_info.copy_dest_exp_bias && single_sample &&
+                       bitwise_equivalent);
+      uint32_t words[8] = {};
+      const uint32_t earlier = previous_destination[signature];
+      if (earlier != 0) {
+        const uint8_t* bytes = memory.TranslatePhysical<const uint8_t*>(earlier);
+        if (bytes != nullptr) {
+          std::memcpy(words, bytes, sizeof(words));
+        }
+      }
+      REXGPU_WARN(
+          "reflect: resolve {}x{} -> format {} swap {} endian {} exp_bias {}; msaa {} "
+          "single_sample {} bitwise {} fast_path {}",
+          width, height, uint32_t(info_out.copy_dest_info.copy_dest_format),
+          uint32_t(info_out.copy_dest_info.copy_dest_swap),
+          uint32_t(info_out.copy_dest_info.copy_dest_endian),
+          int32_t(info_out.copy_dest_info.copy_dest_exp_bias),
+          uint32_t(color_edram_info.msaa_samples), single_sample, bitwise_equivalent,
+          takes_fast_path);
+      REXGPU_WARN("reflect:   what a previous pass left at {:08X}: {:08X} {:08X} {:08X} {:08X}",
+                  earlier, words[0], words[1], words[2], words[3]);
+    }
+    previous_destination[signature] = rb_copy_dest_base;
+  }
 
   REXGPU_TRACE(
       "Resolve: {},{} <= x,y < {},{}, {} -> {} at 0x{:08X} (potentially "

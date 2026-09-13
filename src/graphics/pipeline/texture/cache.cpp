@@ -10,6 +10,9 @@
  */
 
 #include <algorithm>
+#include <set>
+#include <mutex>
+#include <cstdlib>
 #include <cstdint>
 #include <utility>
 
@@ -349,6 +352,13 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+namespace {
+bool XeReflectTraceEnabled() {
+  static const bool enabled = std::getenv("XERENGE_REFLECT_TRACE") != nullptr;
+  return enabled;
+}
+}  // namespace
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {
@@ -504,6 +514,26 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+
+    // XERENGE_REFLECT_TRACE: the other half of the reflection map's story - how
+    // the texture the title resolved into memory is read back. Reported once
+    // per distinct small texture, which is what the cars are lit by; the
+    // full-size ones are not interesting here.
+    if (XeReflectTraceEnabled() && binding.key.GetWidth() <= 256 &&
+        binding.key.GetHeight() <= 256) {
+      static std::mutex trace_mutex;
+      static std::set<uint64_t> reported;
+      const uint64_t signature = uint64_t(binding.key.base_page);
+      std::lock_guard<std::mutex> lock(trace_mutex);
+      if (reported.insert(signature).second) {
+        REXGPU_WARN(
+            "reflect: texture {}x{} format {} endian {} guest_swizzle {:o} host_swizzle {:o} "
+            "at {:08X}",
+            binding.key.GetWidth(), binding.key.GetHeight(), uint32_t(binding.key.format),
+            uint32_t(binding.key.endianness), uint32_t(fetch.swizzle), binding.host_swizzle,
+            uint32_t(binding.key.base_page) << 12);
+      }
+    }
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
