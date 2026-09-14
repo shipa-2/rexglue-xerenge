@@ -122,6 +122,10 @@ class XmpApp : public system::xam::App {
   float volume_;
   Playlist* active_playlist_;
   int active_song_index_;
+  // What PlayFile is decoding right now. Compared on XMPPlayTitlePlaylist so a
+  // title that recreates its playlist handle every frame while previewing a
+  // track does not restart decode when the underlying file did not change.
+  std::string active_file_path_;
 
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;

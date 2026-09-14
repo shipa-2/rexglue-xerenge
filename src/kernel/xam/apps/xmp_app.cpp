@@ -117,6 +117,31 @@ struct SwrContextCloser {
   }
 };
 
+int ResolveSongIndex(const XmpApp::Playlist* playlist, uint32_t song_handle) {
+  if (!song_handle || !playlist || playlist->songs.empty()) {
+    return 0;
+  }
+  for (size_t i = 0; i < playlist->songs.size(); ++i) {
+    if (playlist->songs[i]->handle == song_handle) {
+      return int(i);
+    }
+  }
+  return 0;
+}
+
+// Guest XAudio render buffers are 6-channel, 48 kHz, 256 samples per channel,
+// big-endian float in channel-major order - the layout sequential_6_BE expects.
+void WriteGuestAudioFrame(uint8_t* guest_frame, const float* stereo_interleaved,
+                          uint32_t sample_count, float volume) {
+  std::memset(guest_frame, 0, kFrameBytes);
+  for (uint32_t i = 0; i < sample_count; ++i) {
+    memory::store_and_swap<float>(guest_frame + (0 * kFrameChannelSamples + i) * sizeof(float),
+                                  stereo_interleaved[i * 2 + 0] * volume);
+    memory::store_and_swap<float>(guest_frame + (1 * kFrameChannelSamples + i) * sizeof(float),
+                                  stereo_interleaved[i * 2 + 1] * volume);
+  }
+}
+
 }  // namespace
 
 XmpApp::XmpApp(KernelState* kernel_state)
@@ -151,8 +176,8 @@ void XmpApp::EnsureWorkerStarted() {
 
 bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song_index) {
   auto is_superseded = [&] {
-    return active_playlist_ != playlist || active_song_index_ != song_index ||
-           state_ == State::kIdle;
+    return state_ == State::kIdle || active_song_index_ != song_index ||
+           active_file_path_ != utf8_path;
   };
 
   rex::filesystem::File* vfs_file = nullptr;
@@ -277,12 +302,8 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
     if (is_superseded()) {
       return false;
     }
-    float out[kFrameSamples] = {};
-    for (uint32_t i = 0; i < kFrameChannelSamples; ++i) {
-      out[i * kOutputChannelsInFrame + 0] = stereo[i * 2 + 0] * volume_;
-      out[i * kOutputChannelsInFrame + 1] = stereo[i * 2 + 1] * volume_;
-    }
-    std::memcpy(memory_->TranslateVirtual<float*>(frame_addr), out, kFrameBytes);
+    WriteGuestAudioFrame(memory_->TranslateVirtual(frame_addr), stereo.data(),
+                         kFrameChannelSamples, volume_);
     driver->SubmitFrame(frame_addr);
     stereo.erase(stereo.begin(), stereo.begin() + kFrameChannelSamples * 2);
     return true;
@@ -381,6 +402,7 @@ void XmpApp::WorkerThreadMain() {
     }
     int song_index = active_song_index_;
     auto utf8_path = rex::string::to_utf8(playlist->songs[song_index]->file_path);
+    active_file_path_ = utf8_path;
     REXKRNL_INFO("XMP: playing [{}] {}", song_index, utf8_path);
 
     bool ok = PlayFile(utf8_path, playlist, song_index);
@@ -508,15 +530,24 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   // means restarting from song 0 on every one of those calls would chop the
   // first fraction of a second off song after song, forever - which sounds
   // exactly like noise, not music. Only (re)start when this would actually
-  // change something.
-  if (playlist == active_playlist_ && state_ == State::kPlaying) {
+  // change something. Burnout Revenge also recreates the playlist handle while
+  // previewing a track, so compare the file path rather than the pointer.
+  const int target_index = ResolveSongIndex(playlist, song_handle);
+  if (target_index < 0 || size_t(target_index) >= playlist->songs.size()) {
+    REXKRNL_ERROR("XMPPlayTitlePlaylist: song index {} out of range", target_index);
+    return X_E_INVALIDARG;
+  }
+  const auto target_path = rex::string::to_utf8(playlist->songs[target_index]->file_path);
+  if (state_ == State::kPlaying && target_index == active_song_index_ &&
+      target_path == active_file_path_) {
+    active_playlist_ = playlist;
     OnStateChanged();
     kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
     return X_E_SUCCESS;
   }
   EnsureWorkerStarted();
   active_playlist_ = playlist;
-  active_song_index_ = 0;
+  active_song_index_ = target_index;
   state_ = State::kPlaying;
   resume_fence_.Signal();
   OnStateChanged();
@@ -539,6 +570,7 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
+  active_file_path_.clear();
   state_ = State::kIdle;
   resume_fence_.Signal();
   OnStateChanged();
