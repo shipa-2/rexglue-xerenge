@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/app_manager.h>
+#include <rex/thread.h>
 #include <rex/thread/mutex.h>
 
 namespace rex {
@@ -96,6 +98,22 @@ class XmpApp : public system::xam::App {
 
   void OnStateChanged();
 
+  // Decodes and plays one song on the worker thread below, blocking until it
+  // ends, fails, or is superseded by a different (playlist, song index) pair -
+  // a track change or a stop, both visible as active_playlist_/
+  // active_song_index_ no longer matching what was passed in. Returns false
+  // only on an actual decode/IO failure, not on being superseded.
+  bool PlayFile(const std::string& utf8_path, Playlist* playlist, int song_index);
+  // Waits for something to play, plays the active playlist starting at
+  // active_song_index_, and on a song ending on its own (PlayFile returned
+  // true and nothing else changed underneath it) advances to the next song
+  // and loops the playlist - titles that reach this point want continuous
+  // background music, not two minutes of silence once the list runs out.
+  void WorkerThreadMain();
+  // Starts the worker thread on first real use rather than at construction -
+  // see the constructor for why.
+  void EnsureWorkerStarted();
+
   State state_;
   PlaybackClient playback_client_;
   PlaybackMode playback_mode_;
@@ -109,6 +127,15 @@ class XmpApp : public system::xam::App {
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+
+  // The decode thread and its own idle/pause wait. There is deliberately no
+  // driver_/driver_mutex_ member: PlayFile owns its AudioDriver locally for
+  // the run of one song, and volume/pause are applied by the decode loop
+  // itself (reading volume_/state_ each frame) rather than by reaching into
+  // the driver from another thread.
+  std::atomic<bool> worker_running_ = {false};
+  std::unique_ptr<rex::thread::Thread> worker_thread_;
+  rex::thread::Fence resume_fence_;
 };
 
 }  // namespace apps

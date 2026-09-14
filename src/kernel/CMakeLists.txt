@@ -66,4 +66,8 @@ set(REXKERNEL_SOURCES
 list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
-target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+# libavformat/libswresample directly: xmp_app.cpp (XMP playback) decodes and
+# resamples on its own, and rexaudio links FFmpeg PRIVATE to itself rather than
+# re-exporting it to every consumer.
+target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput
+                                        imgui libavcodec libavformat libavutil libswresample)

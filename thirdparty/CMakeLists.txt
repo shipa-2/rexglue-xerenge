@@ -426,6 +426,12 @@ configure_file(
   "${FFMPEG_OVERLAY_SRC_DIR}/bsf_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/bsf_list.c"
   COPYONLY
 )
+file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libswresample")
+configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/swresample_dsp_x86_stub.c"
+  "${FFMPEG_OVERLAY_BUILD_DIR}/libswresample/swresample_dsp_x86_stub.c"
+  COPYONLY
+)
 
 # Common defines for both libraries
 set(FFMPEG_COMMON_DEFINES
@@ -695,10 +701,87 @@ if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
 endif()
 
+# libavformat - demuxing, for XMP (Xbox Music Player) title soundtrack files.
+# Curated to ASF (WMA) and MP3, the two container formats XMP songs come in;
+# no muxers, and just the "file" protocol, since playback reads through the
+# guest's own VFS via a custom AVIOContext rather than a URL. The demuxer,
+# muxer and protocol lists are not overlay files like codec_list.c above -
+# libavformat/demuxer_list.c, muxer_list.c and protocol_list.c already exist at
+# their real path in the vendored tree, already curated to exactly this set,
+# and are pulled in by #include from allformats.c/protocols.c, so they are not
+# listed as sources here.
+add_library(libavformat STATIC
+    ${FFMPEG_DIR}/libavformat/allformats.c
+    ${FFMPEG_DIR}/libavformat/avio.c
+    ${FFMPEG_DIR}/libavformat/aviobuf.c
+    ${FFMPEG_DIR}/libavformat/dump.c
+    ${FFMPEG_DIR}/libavformat/format.c
+    ${FFMPEG_DIR}/libavformat/id3v1.c
+    ${FFMPEG_DIR}/libavformat/id3v2.c
+    ${FFMPEG_DIR}/libavformat/metadata.c
+    ${FFMPEG_DIR}/libavformat/mux.c
+    ${FFMPEG_DIR}/libavformat/options.c
+    ${FFMPEG_DIR}/libavformat/os_support.c
+    ${FFMPEG_DIR}/libavformat/protocols.c
+    ${FFMPEG_DIR}/libavformat/riff.c
+    ${FFMPEG_DIR}/libavformat/sdp.c
+    ${FFMPEG_DIR}/libavformat/url.c
+    ${FFMPEG_DIR}/libavformat/utils.c
+    # ASF (WMA) demuxer.
+    ${FFMPEG_DIR}/libavformat/asfdec_f.c
+    ${FFMPEG_DIR}/libavformat/asf.c
+    ${FFMPEG_DIR}/libavformat/asfcrypt.c
+    ${FFMPEG_DIR}/libavformat/avlanguage.c
+    # MP3 demuxer.
+    ${FFMPEG_DIR}/libavformat/mp3dec.c
+    ${FFMPEG_DIR}/libavformat/replaygain.c
+    # riffdec.c: ff_get_wav_header(), which asfdec_f.c uses to parse the
+    # WAVEFORMATEX embedded in a stream's type-specific data.
+    ${FFMPEG_DIR}/libavformat/riffdec.c
+    # The "file" protocol: protocol_list.c names it, and nothing opens files
+    # through a URL here (playback goes through a custom AVIOContext reading
+    # the guest's own VFS instead), but the symbol still has to exist to link.
+    ${FFMPEG_DIR}/libavformat/file.c
+)
+if(WIN32)
+    target_sources(libavformat PRIVATE ${FFMPEG_DIR}/libavformat/file_open.c)
+endif()
+target_include_directories(libavformat
+    PUBLIC
+        $<BUILD_INTERFACE:${FFMPEG_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_compile_definitions(libavformat PRIVATE ${FFMPEG_COMMON_DEFINES})
+target_compile_options(libavformat PRIVATE -w)
+target_link_libraries(libavformat PUBLIC libavcodec libavutil)
+
+# libswresample - resampling, to bring a song's own sample rate and channel
+# layout to the fixed format the SDL audio driver submits frames in.
+add_library(libswresample STATIC
+    ${FFMPEG_DIR}/libswresample/audioconvert.c
+    ${FFMPEG_DIR}/libswresample/dither.c
+    ${FFMPEG_DIR}/libswresample/options.c
+    ${FFMPEG_DIR}/libswresample/rematrix.c
+    ${FFMPEG_DIR}/libswresample/resample.c
+    ${FFMPEG_DIR}/libswresample/resample_dsp.c
+    ${FFMPEG_DIR}/libswresample/swresample.c
+    ${FFMPEG_DIR}/libswresample/swresample_frame.c
+    ${FFMPEG_OVERLAY_BUILD_DIR}/libswresample/swresample_dsp_x86_stub.c
+)
+target_include_directories(libswresample BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
+target_include_directories(libswresample
+    PUBLIC
+        $<BUILD_INTERFACE:${FFMPEG_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_compile_definitions(libswresample PRIVATE ${FFMPEG_COMMON_DEFINES})
+target_compile_options(libswresample PRIVATE -w)
+target_link_libraries(libswresample PUBLIC libavutil)
+
 # Hidden visibility is required on aarch64. The NEON .S files use ADRP/ADD
 # PC-relative addressing (movrel) for symbols like ff_cos_*, which the linker
 # only accepts against locally bound symbols when emitting a shared object.
-set_target_properties(libavutil libavcodec PROPERTIES
+set_target_properties(libavutil libavcodec libavformat libswresample PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     FOLDER "FFmpeg")

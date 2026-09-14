@@ -48,6 +48,15 @@ class AudioSystem : public system::IAudioSystem {
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, uint32_t samples_ptr);
 
+  // A driver of its own, outside the fixed-size client array above and not
+  // tied to a guest render callback - for a host thread that decodes and
+  // pushes frames on its own schedule, such as the XMP (Xbox Music Player)
+  // background music decoder. The caller owns the semaphore, submits frames
+  // by calling the returned driver directly, and destroys it with
+  // DestroyHostDriver when done.
+  X_STATUS CreateHostDriver(rex::thread::Semaphore* semaphore, AudioDriver** out_driver);
+  void DestroyHostDriver(AudioDriver* driver);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 

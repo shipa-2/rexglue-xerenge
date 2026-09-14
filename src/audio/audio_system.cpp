@@ -260,6 +260,19 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   return X_STATUS_SUCCESS;
 }
 
+X_STATUS AudioSystem::CreateHostDriver(rex::thread::Semaphore* semaphore,
+                                       AudioDriver** out_driver) {
+  // kMaximumClientCount as the index: CreateDriver's backends (SDL, NOP) both
+  // ignore it, and it deliberately falls outside clients_[], which this driver
+  // never joins.
+  return CreateDriver(kMaximumClientCount, semaphore, out_driver);
+}
+
+void AudioSystem::DestroyHostDriver(AudioDriver* driver) {
+  assert_not_null(driver);
+  DestroyDriver(driver);
+}
+
 void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   SCOPE_profile_cpu_f("apu");
 
