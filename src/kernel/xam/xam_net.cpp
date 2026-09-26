@@ -1043,11 +1043,16 @@ u32 SocketName(u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, mapped_u32 name_
     return -1;
   }
   sockaddr_in native = {};
+#if REX_PLATFORM_WIN32
+  const auto handle = SOCKET(socket->native_handle());
+  int native_len = sizeof(native);
+#else
+  const int handle = int(socket->native_handle());
   socklen_t native_len = sizeof(native);
-  const int ret = peer ? getpeername(int(socket->native_handle()),
-                                     reinterpret_cast<sockaddr*>(&native), &native_len)
-                       : getsockname(int(socket->native_handle()),
-                                     reinterpret_cast<sockaddr*>(&native), &native_len);
+#endif
+  const int ret =
+      peer ? getpeername(handle, reinterpret_cast<sockaddr*>(&native), &native_len)
+           : getsockname(handle, reinterpret_cast<sockaddr*>(&native), &native_len);
   if (ret < 0) {
     SetLastSocketError();
     return -1;

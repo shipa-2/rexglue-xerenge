@@ -13,7 +13,9 @@
 #include <thread>
 #include <atomic>
 #include <string>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <rex/rex_app.h>
 
 #include <cstdlib>
@@ -433,6 +435,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
+#ifndef _WIN32
   // A picture of the window, taken on request. Describing a broken frame in
   // words loses most of what matters about it; a file in logs/shots does not.
   // F12 is left alone - RenderDoc's overlay already uses it.
@@ -459,6 +462,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       }
     }).detach();
   });
+#endif  // _WIN32: the capture uses xdotool and ImageMagick's import, X11 only
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();

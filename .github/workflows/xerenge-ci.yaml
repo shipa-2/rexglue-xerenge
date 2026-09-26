@@ -2,8 +2,8 @@ name: Xerenge fork CI
 
 # The upstream platform workflows run only on release tags. The fork's own
 # changes (threading, sockets, audio, the online stub) have to keep building
-# on Windows as well, so every push to main builds win-amd64 and keeps the
-# result as a workflow artifact - no release is published.
+# on Windows as well, so every push to main builds what Xerenge's
+# scripts/setup-sdk.sh builds - the Release rexglue target - on win-amd64.
 on:
   push:
     branches: [main]
@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: xerenge-ci-${{ github.ref }}
@@ -19,9 +18,28 @@ concurrency:
 
 jobs:
   win-amd64:
-    uses: ./.github/workflows/_build-platform.yaml
-    with:
-      platform: win-amd64
-      ref: ${{ github.sha }}
-      publish_mode: artifact
-      artifact_name: rexglue-sdk-win-amd64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install LLVM, CMake, Ninja
+        run: choco install llvm cmake ninja -y
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: xerenge-win-amd64
+
+      - name: Configure
+        run: cmake --preset win-amd64 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build (Release, rexglue)
+        run: cmake --build out/build/win-amd64 --config Release --target rexglue --parallel
+
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
