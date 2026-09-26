@@ -1,0 +1,27 @@
+name: Xerenge fork CI
+
+# The upstream platform workflows run only on release tags. The fork's own
+# changes (threading, sockets, audio, the online stub) have to keep building
+# on Windows as well, so every push to main builds win-amd64 and keeps the
+# result as a workflow artifact - no release is published.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: xerenge-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  win-amd64:
+    uses: ./.github/workflows/_build-platform.yaml
+    with:
+      platform: win-amd64
+      ref: ${{ github.sha }}
+      publish_mode: artifact
+      artifact_name: rexglue-sdk-win-amd64
