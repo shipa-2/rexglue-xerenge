@@ -359,9 +359,17 @@ bool ReXApp::SetupPresentation() {
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
 
+#ifndef _WIN32
+  // Only where plume actually asks SDL for a Vulkan-capable window: on
+  // Windows it draws through the raw HWND instead (see plume_swapchain.cpp's
+  // NativeRenderWindow), and thirdparty/CMakeLists.txt builds SDL there with
+  // SDL_VULKAN off, so SDL_CreateWindow(..., SDL_WINDOW_VULKAN) always fails
+  // there ("Vulkan support is either not configured ... or not available in
+  // current SDL video driver (windows)"), leaving no render window at all.
   if (config_.gpu_plugin == "plume") {
     window_->SetWantsVulkanWindow(true);
   }
+#endif
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
   }
