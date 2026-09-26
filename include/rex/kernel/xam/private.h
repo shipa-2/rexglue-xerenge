@@ -19,6 +19,10 @@ namespace xam {
 
 bool xeXamIsUIActive();
 
+// --online: answer as if signed in to Xbox Live with a working connection (a
+// stub - no real service is contacted). Defined in xam_net.cpp.
+bool OnlineStub();
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cerrno>
 #include <cstring>
 
 #if REX_PLATFORM_MAC
@@ -19,6 +20,7 @@
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -44,6 +46,14 @@
 #include <sys/socket.h>
 #endif
 
+// --online: answer as a console signed in to Xbox Live with a working
+// connection would. Nothing here reaches a real service - it only gets a title
+// past the checks in front of its online menus. Off, everything is as before:
+// no cable, not signed in to Live.
+REXCVAR_DEFINE_BOOL(online, false, "Network",
+                    "Pretend to be signed in to Xbox Live with a working connection (a stub for "
+                    "reaching online menus; no real service is contacted)");
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -59,6 +69,76 @@ enum {
   XNCALLER_TEST = 0x4,
   NUM_XNCALLER_TYPES = 0x4,
 };
+
+// Set by --online (the cvar is defined above, outside the namespace, so the
+// title's own code can read it too).
+bool OnlineStub() {
+  return REXCVAR_GET(online);
+}
+
+namespace {
+// --online: what the title says on the wire, to learn the protocols it talks
+// (EA's Aries lobby among them). At most 256 bytes a call, as text where it is
+// printable and \xNN where it is not.
+void LogWire(const char* what, uint32_t socket, const uint8_t* data, int length) {
+  if (!OnlineStub() || length <= 0 || !data) {
+    return;
+  }
+  std::string text;
+  const int shown = std::min(length, 256);
+  for (int i = 0; i < shown; ++i) {
+    const uint8_t c = data[i];
+    if (c >= 0x20 && c < 0x7F && c != '\\') {
+      text += char(c);
+    } else {
+      char hex[5];
+      std::snprintf(hex, sizeof(hex), "\\x%02X", c);
+      text += hex;
+    }
+  }
+  REXKRNL_INFO("--online wire: {} socket {:08X} {} byte(s){}: {}", what, socket, length,
+               length > shown ? " (first 256)" : "", text);
+}
+}  // namespace
+
+// The last socket error, as the title's WinSock would report it. On Linux the
+// host reports it in errno, in its own numbering; without this the title saw
+// either "no error" or a generic failure - a non-blocking connect in progress
+// read as a failed one, and "no data yet" from recv as a broken connection.
+void SetLastSocketError() {
+#if REX_PLATFORM_WIN32
+  XThread::SetLastError(WSAGetLastError());
+#else
+  uint32_t wsa;
+  switch (errno) {
+    case EWOULDBLOCK:
+#if EAGAIN != EWOULDBLOCK
+    case EAGAIN:
+#endif
+    case EINPROGRESS:
+      wsa = 10035;  // WSAEWOULDBLOCK (what a non-blocking connect returns too)
+      break;
+    case EALREADY: wsa = 10037; break;       // WSAEALREADY
+    case ENOTSOCK: wsa = 10038; break;       // WSAENOTSOCK
+    case EMSGSIZE: wsa = 10040; break;       // WSAEMSGSIZE
+    case EADDRINUSE: wsa = 10048; break;     // WSAEADDRINUSE
+    case EADDRNOTAVAIL: wsa = 10049; break;  // WSAEADDRNOTAVAIL
+    case ENETDOWN: wsa = 10050; break;       // WSAENETDOWN
+    case ENETUNREACH: wsa = 10051; break;    // WSAENETUNREACH
+    case ECONNABORTED: wsa = 10053; break;   // WSAECONNABORTED
+    case ECONNRESET: wsa = 10054; break;     // WSAECONNRESET
+    case ENOBUFS: wsa = 10055; break;        // WSAENOBUFS
+    case EISCONN: wsa = 10056; break;        // WSAEISCONN
+    case ENOTCONN: wsa = 10057; break;       // WSAENOTCONN
+    case ETIMEDOUT: wsa = 10060; break;      // WSAETIMEDOUT
+    case ECONNREFUSED: wsa = 10061; break;   // WSAECONNREFUSED
+    case EHOSTUNREACH: wsa = 10065; break;   // WSAEHOSTUNREACH
+    case EINVAL: wsa = 10022; break;         // WSAEINVAL
+    default: wsa = 10050; break;
+  }
+  XThread::SetLastError(wsa);
+#endif
+}
 
 // https://github.com/pmrowla/hl2sdk-csgo/blob/master/common/xbox/xboxstubs.h
 typedef struct {
@@ -436,6 +516,21 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  if (OnlineStub()) {
+    // A console with a static address behind a gateway, DNS configured and
+    // online. EA's DirtySock reads GATEWAY/DNS as "+isp" - an internet
+    // connection - and anything less as a problem to report.
+    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+    addr_ptr->inaOnline.s_addr = htonl(INADDR_LOOPBACK);
+    addr_ptr->wPortOnline = 3074;
+    std::memset(addr_ptr->abEnet, 0xCC, 6);
+    for (uint8_t i = 0; i < 20; ++i) {
+      addr_ptr->abOnline[i] = uint8_t(0x5A + i);
+    }
+    return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
+           XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS |
+           XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  }
   // Just return a loopback address atm.
   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
@@ -480,6 +575,12 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
+  if (OnlineStub() && in_addr) {
+    // Every peer is this machine.
+    const uint32_t loopback = htonl(INADDR_LOOPBACK);
+    std::memcpy(in_addr, &loopback, sizeof(loopback));
+    return 0;
+  }
   return 1;
 }
 
@@ -505,11 +606,31 @@ struct XEthernetStatus {
   static const uint32_t XNET_ETHERNET_LINK_HALF_DUPLEX = 0x10;
 };
 
+// Opening a secure connection to a peer or a service. Only --online answers:
+// without it these stay what the old stubs returned (the caller argument, 1 -
+// an error to XNetConnect, "pending" to XNetGetConnectStatus).
+u32 NetDll_XNetConnect_entry(u32 caller, u32 in_addr) {
+  return OnlineStub() ? 0 : 1;
+}
+
+u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 in_addr) {
+  constexpr uint32_t kConnectStatusConnected = 2;  // XNET_CONNECT_STATUS_CONNECTED
+  return OnlineStub() ? kConnectStatusConnected : 1;
+}
+
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
+  if (OnlineStub()) {
+    return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE | XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
+           XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;
+  }
   return 0;
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: DNS lookup of '{}' (answered: not found)",
+                 host ? std::string(host.host_address()) : std::string("?"));
+  }
   // TODO(gibbed): actually implement this
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
@@ -620,12 +741,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
 
   auto ret = socket->Shutdown(how);
   if (ret == -1) {
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
+SetLastSocketError();
   }
   return ret;
 }
@@ -688,9 +804,15 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   }
 
   N_XSOCKADDR native_name(name);
+  if (OnlineStub()) {
+    const auto* in = reinterpret_cast<const XSOCKADDR_IN*>(name.host_address());
+    const uint32_t ip = in->sin_addr;
+    REXKRNL_INFO("--online wire: connect socket {:08X} to {}.{}.{}.{}:{}", socket_handle,
+                 ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, uint16_t(in->sin_port));
+  }
   X_STATUS status = socket->Connect(&native_name, namelen);
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    SetLastSocketError();
     return -1;
   }
 
@@ -828,8 +950,22 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
     timeout_in = &timeout;
   }
-  int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
-                   exceptfds ? &native_exceptfds : nullptr, timeout_in);
+  // The title's nfds is WinSock's, which ignores it (titles pass 1 or 0). On
+  // POSIX it bounds the descriptors examined - highest plus one - and with the
+  // title's value no socket was ever looked at: a non-blocking connect never
+  // showed as writable, so it never showed as complete.
+  int native_nfds = nfds;
+#if !REX_PLATFORM_WIN32
+  native_nfds = 0;
+  for (const host_set* set : {&host_readfds, &host_writefds, &host_exceptfds}) {
+    for (uint32_t i = 0; i < set->count; ++i) {
+      native_nfds = std::max(native_nfds, int(set->sockets[i]->native_handle()) + 1);
+    }
+  }
+#endif
+  int ret = select(native_nfds, readfds ? &native_readfds : nullptr,
+                   writefds ? &native_writefds : nullptr, exceptfds ? &native_exceptfds : nullptr,
+                   timeout_in);
   if (readfds) {
     host_readfds.UpdateFrom(&native_readfds);
     host_readfds.Store(readfds);
@@ -855,7 +991,13 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Recv(buf_ptr, buf_len, flags);
+  const int received = socket->Recv(buf_ptr, buf_len, flags);
+  if (received < 0) {
+    SetLastSocketError();
+    return received;
+  }
+  LogWire("recv", socket_handle, static_cast<const uint8_t*>(buf_ptr.host_address()), received);
+  return received;
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -886,16 +1028,50 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   }
 
   if (ret == -1) {
-// TODO: Better way of getting the error code
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
+SetLastSocketError();
   }
 
   return ret;
+}
+
+// The address at either end of a connected socket. DirtySock asks for the peer
+// to learn that a non-blocking connect has completed; these were stubs.
+u32 SocketName(u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, mapped_u32 name_len, bool peer) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(0x2736);  // WSAENOTSOCK
+    return -1;
+  }
+  sockaddr_in native = {};
+  socklen_t native_len = sizeof(native);
+  const int ret = peer ? getpeername(int(socket->native_handle()),
+                                     reinterpret_cast<sockaddr*>(&native), &native_len)
+                       : getsockname(int(socket->native_handle()),
+                                     reinterpret_cast<sockaddr*>(&native), &native_len);
+  if (ret < 0) {
+    SetLastSocketError();
+    return -1;
+  }
+  if (name) {
+    name->sin_family = 2;  // AF_INET
+    name->sin_port = ntohs(native.sin_port);
+    name->sin_addr = ntohl(native.sin_addr.s_addr);
+    std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  }
+  if (name_len) {
+    *name_len = sizeof(XSOCKADDR_IN);
+  }
+  return 0;
+}
+
+u32 NetDll_getpeername_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_len) {
+  return SocketName(socket_handle, name, name_len, true);
+}
+
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 name_len) {
+  return SocketName(socket_handle, name, name_len, false);
 }
 
 u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
@@ -906,7 +1082,13 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Send(buf_ptr, buf_len, flags);
+  LogWire("send", socket_handle, static_cast<const uint8_t*>(buf_ptr.host_address()),
+          int(buf_len));
+  const int sent = socket->Send(buf_ptr, buf_len, flags);
+  if (sent < 0) {
+    SetLastSocketError();
+  }
+  return sent;
 }
 
 u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
@@ -919,7 +1101,11 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  const int sent = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  if (sent < 0) {
+    SetLastSocketError();
+  }
+  return sent;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -961,6 +1147,8 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
            rex::kernel::xam::NetDll_XNetXnAddrToMachineId_entry)
 REX_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
 REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
+REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
+REX_EXPORT(__imp__NetDll_XNetGetConnectStatus, rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
 REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
 REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
@@ -985,6 +1173,8 @@ REX_EXPORT(__imp__NetDll_select, rex::kernel::xam::NetDll_select_entry)
 REX_EXPORT(__imp__NetDll_recv, rex::kernel::xam::NetDll_recv_entry)
 REX_EXPORT(__imp__NetDll_recvfrom, rex::kernel::xam::NetDll_recvfrom_entry)
 REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
+REX_EXPORT(__imp__NetDll_getpeername, rex::kernel::xam::NetDll_getpeername_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
@@ -1033,12 +1223,10 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
 REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
@@ -1100,6 +1288,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
 REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
-REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
 REX_EXPORT_STUB(__imp__NetDll_getsockopt);

@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
+#include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -48,6 +49,19 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // and pServiceInfo. pServiceInfo should contain pointer to
       // XONLINE_SERVICE_INFO structure.
       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (OnlineStub() && buffer_length) {
+        // XONLINE_SERVICE_INFO { dwServiceID, IN_ADDR serviceIP, WORD
+        // wServicePort, WORD reserved }: the service is on this machine.
+        // Titles that reach their own servers through Live (EA's DirtySock)
+        // refuse to go online while this fails.
+        auto info = memory_->TranslateVirtual(buffer_length);
+        memory::store_and_swap<uint32_t>(info + 0, buffer_ptr);
+        memory::store_and_swap<uint32_t>(info + 4, 0x7F000001);
+        memory::store_and_swap<uint16_t>(info + 8, 3074);
+        memory::store_and_swap<uint16_t>(info + 10, 0);
+        REXKRNL_INFO("--online: service {:08X} answered as 127.0.0.1:3074", buffer_ptr);
+        return X_E_SUCCESS;
+      }
       return 0x80151802;  // ERROR_CONNECTION_INVALID
     }
     case 0x00058020: {

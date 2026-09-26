@@ -65,12 +65,15 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   return result;
 }
 
+// eXUserSigninState_SignedInToLive, for --online.
+constexpr uint32_t kSignedInToLive = 2;
+
 u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+      signin_state = OnlineStub() ? kSignedInToLive : user_profile->signin_state();
     }
   }
   return signin_state;
@@ -98,7 +101,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
+  info->signin_state = OnlineStub() ? kSignedInToLive : user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
@@ -382,8 +385,9 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // If we deny everything, games should hopefully not try to do stuff. With
+  // --online everything is allowed, as for an adult Gold account.
+  *out_value = OnlineStub() ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
