@@ -12,7 +12,13 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <array>
 #include <cerrno>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <random>
+#include <string>
 #include <cstring>
 
 #if REX_PLATFORM_MAC
@@ -22,6 +28,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
+#include <rex/kernel/xam/online.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -39,11 +46,13 @@
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
+#include <ws2tcpip.h>                    // inet_pton, inet_ntop
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 // --online: answer as a console signed in to Xbox Live with a working
@@ -53,6 +62,10 @@
 REXCVAR_DEFINE_BOOL(online, false, "Network",
                     "Pretend to be signed in to Xbox Live with a working connection (a stub for "
                     "reaching online menus; no real service is contacted)");
+REXCVAR_DEFINE_STRING(online_address, "", "Network",
+                      "With --online: the IPv4 this console gives its peers and binds its "
+                      "sockets to (e.g. 127.0.0.2 and 127.0.0.3 to run two copies on one "
+                      "machine). Empty: the address of the interface that reaches the LAN");
 
 namespace rex {
 namespace kernel {
@@ -75,6 +88,98 @@ enum {
 bool OnlineStub() {
   return REXCVAR_GET(online);
 }
+
+namespace {
+std::mutex g_online_mutex;
+// A function-local static: the title's side may register its provider from its
+// own static initialisers, which can run before this file's.
+std::function<uint32_t()>& ServiceAddressProvider() {
+  static std::function<uint32_t()> provider;
+  return provider;
+}
+}  // namespace
+
+void SetOnlineServiceAddressProvider(std::function<uint32_t()> provider) {
+  std::lock_guard lock(g_online_mutex);
+  ServiceAddressProvider() = std::move(provider);
+}
+
+uint32_t OnlineServiceAddress() {
+  std::function<uint32_t()> provider;
+  {
+    std::lock_guard lock(g_online_mutex);
+    provider = ServiceAddressProvider();
+  }
+  const uint32_t address = provider ? provider() : 0;
+  return address ? address : htonl(INADDR_LOOPBACK);
+}
+
+uint32_t OnlineLocalAddress() {
+  static const uint32_t address = [] {
+    const std::string configured = REXCVAR_GET(online_address);
+    if (!configured.empty()) {
+      in_addr parsed{};
+      if (inet_pton(AF_INET, configured.c_str(), &parsed) == 1) {
+        return uint32_t(parsed.s_addr);
+      }
+      REXKRNL_WARN("--online: online_address '{}' is not an IPv4 address", configured);
+    }
+    // The interface a packet to the outside would leave by. A UDP "connect"
+    // only picks the route; nothing is sent.
+#if REX_PLATFORM_WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    uint32_t found = htonl(INADDR_LOOPBACK);
+    const auto probe = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(9);
+    inet_pton(AF_INET, "192.0.2.1", &to.sin_addr);  // TEST-NET-1, never answered
+    if (::connect(probe, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0) {
+      sockaddr_in self{};
+#if REX_PLATFORM_WIN32
+      int self_len = sizeof(self);
+#else
+      socklen_t self_len = sizeof(self);
+#endif
+      if (::getsockname(probe, reinterpret_cast<sockaddr*>(&self), &self_len) == 0 &&
+          self.sin_addr.s_addr != 0) {
+        found = self.sin_addr.s_addr;
+      }
+    }
+#if REX_PLATFORM_WIN32
+    closesocket(probe);
+#else
+    ::close(probe);
+#endif
+    char text[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &found, text, sizeof(text));
+    REXKRNL_INFO("--online: this console's address is {}", text);
+    return found;
+  }();
+  return address;
+}
+
+namespace {
+// The XNADDRs the title has turned into IN_ADDRs, by the IN_ADDR, for the
+// way back. An IN_ADDR is the peer's real IPv4 here.
+std::map<uint32_t, std::array<uint8_t, 36>> g_known_xnaddrs;
+
+// Distinct per console: peers tell each other apart by these, and two
+// copies of the game must not look like one.
+void FillConsoleIdentity(uint32_t address, uint8_t enet[6], uint8_t online[20]) {
+  const uint8_t* ip = reinterpret_cast<const uint8_t*>(&address);
+  enet[0] = 0x02;  // locally administered
+  enet[1] = 0x58;
+  for (int i = 0; i < 4; ++i) {
+    enet[2 + i] = ip[i];
+  }
+  for (uint8_t i = 0; i < 20; ++i) {
+    online[i] = uint8_t(0x5A + i) ^ ip[i % 4];
+  }
+}
+}  // namespace
 
 namespace {
 // --online: what the title says on the wire, to learn the protocols it talks
@@ -519,14 +624,14 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   if (OnlineStub()) {
     // A console with a static address behind a gateway, DNS configured and
     // online. EA's DirtySock reads GATEWAY/DNS as "+isp" - an internet
-    // connection - and anything less as a problem to report.
-    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
-    addr_ptr->inaOnline.s_addr = htonl(INADDR_LOOPBACK);
+    // connection - and anything less as a problem to report. The address is
+    // the real one, so that peers who are handed this XNADDR (through a
+    // lobby) can reach this console directly.
+    const uint32_t address = OnlineLocalAddress();
+    addr_ptr->ina.s_addr = address;
+    addr_ptr->inaOnline.s_addr = address;
     addr_ptr->wPortOnline = 3074;
-    std::memset(addr_ptr->abEnet, 0xCC, 6);
-    for (uint8_t i = 0; i < 20; ++i) {
-      addr_ptr->abOnline[i] = uint8_t(0x5A + i);
-    }
+    FillConsoleIdentity(address, addr_ptr->abEnet, addr_ptr->abOnline);
     return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC |
            XnAddrStatus::XNET_GET_XNADDR_GATEWAY | XnAddrStatus::XNET_GET_XNADDR_DNS |
            XnAddrStatus::XNET_GET_XNADDR_ONLINE;
@@ -568,27 +673,64 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
+  if (OnlineStub()) {
+    // in_addr arrives as the guest's big-endian word, which is network order.
+    const uint32_t network = htonl(in_addr);
+    char text[INET_ADDRSTRLEN] = "0.0.0.0";
+    inet_ntop(AF_INET, &network, text, sizeof(text));
+    rex::string::copy_truncating(string_out, text, string_size);
+    return;
+  }
   rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
-// subsequent socket calls (like a handle to a XNet address)
+// subsequent socket calls (like a handle to a XNet address). On a console it is
+// an opaque handle into the secure-connection table; here it is the peer's
+// real IPv4, which the sockets can send to as they are.
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  if (OnlineStub() && in_addr) {
-    // Every peer is this machine.
-    const uint32_t loopback = htonl(INADDR_LOOPBACK);
-    std::memcpy(in_addr, &loopback, sizeof(loopback));
+  if (OnlineStub() && in_addr && xn_addr) {
+    uint32_t address = xn_addr->ina.s_addr ? uint32_t(xn_addr->ina.s_addr)
+                                           : uint32_t(xn_addr->inaOnline.s_addr);
+    if (!address) {
+      address = htonl(INADDR_LOOPBACK);
+    }
+    {
+      std::lock_guard lock(g_online_mutex);
+      std::array<uint8_t, 36> copy;
+      std::memcpy(copy.data(), static_cast<XNADDR*>(xn_addr), sizeof(XNADDR));
+      g_known_xnaddrs[address] = copy;
+    }
+    std::memcpy(in_addr, &address, sizeof(address));
     return 0;
   }
   return 1;
 }
 
-// Does the reverse of the above.
-// FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
+// Does the reverse of the above: the XNADDR an IN_ADDR came from.
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
-  return 1;
+  if (!OnlineStub() || !xn_addr) {
+    return 1;
+  }
+  const uint32_t address = htonl(in_addr);
+  std::lock_guard lock(g_online_mutex);
+  const auto it = g_known_xnaddrs.find(address);
+  if (it != g_known_xnaddrs.end()) {
+    std::memcpy(static_cast<XNADDR*>(xn_addr), it->second.data(), sizeof(XNADDR));
+  } else {
+    // Never handed over: an address with nothing else known about it.
+    std::memset(static_cast<XNADDR*>(xn_addr), 0, sizeof(XNADDR));
+    xn_addr->ina.s_addr = address;
+    xn_addr->inaOnline.s_addr = address;
+    xn_addr->wPortOnline = 3074;
+    FillConsoleIdentity(address, xn_addr->abEnet, xn_addr->abOnline);
+  }
+  if (xid) {
+    std::memset(xid, 0, 8);
+  }
+  return 0;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
@@ -678,9 +820,338 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   return 0;
 }
 
+// --online QoS. On a console XNetQosLookup probes a peer and brings back
+// whatever the peer published with XNetQosListen for that session key -
+// titles pass session details that way. Here each copy of the game answers
+// such probes on UDP 3075 (on its online_address) with what it published:
+//   probe  "XQS?" + XNKID (8 bytes)
+//   answer "XQS!" + XNKID + the published data
+namespace {
+constexpr uint16_t kQosPort = 3075;
+constexpr uint8_t kQosInfoComplete = 0x01;
+constexpr uint8_t kQosInfoTargetContacted = 0x02;
+constexpr uint8_t kQosInfoDataReceived = 0x08;
+constexpr uint32_t kQosListenEnable = 0x01;
+constexpr uint32_t kQosListenDisable = 0x02;
+constexpr uint32_t kQosListenSetData = 0x04;
+constexpr uint32_t kQosListenRelease = 0x10;
+
+struct QosListener {
+  bool enabled = false;
+  std::vector<uint8_t> data;
+};
+std::map<uint64_t, QosListener> g_qos_listeners;  // by XNKID; g_online_mutex
+
+#if REX_PLATFORM_WIN32
+using NativeSocket = SOCKET;
+void CloseNative(NativeSocket s) { closesocket(s); }
+bool NativeValid(NativeSocket s) { return s != INVALID_SOCKET; }
+#else
+using NativeSocket = int;
+void CloseNative(NativeSocket s) { ::close(s); }
+bool NativeValid(NativeSocket s) { return s >= 0; }
+#endif
+
+// A guest buffer's bytes.
+uint8_t* Bytes(mapped_void p) {
+  return static_cast<uint8_t*>(static_cast<void*>(p));
+}
+
+uint64_t KidKey(const uint8_t* kid) {
+  uint64_t key = 0;
+  std::memcpy(&key, kid, 8);
+  return key;
+}
+
+// The address the QoS socket and the title's unaddressed binds use: the
+// configured one, or any when the console just uses its LAN address.
+uint32_t BindAddress() {
+  return REXCVAR_GET(online_address).empty() ? htonl(INADDR_ANY) : OnlineLocalAddress();
+}
+
+void StartQosResponder() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      const NativeSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      sockaddr_in at{};
+      at.sin_family = AF_INET;
+      at.sin_port = htons(kQosPort);
+      at.sin_addr.s_addr = BindAddress();
+      if (!NativeValid(s) || ::bind(s, reinterpret_cast<sockaddr*>(&at), sizeof(at)) != 0) {
+        REXKRNL_WARN("--online: QoS responder cannot bind port {}; peers will get no QoS data",
+                     kQosPort);
+        if (NativeValid(s)) {
+          CloseNative(s);
+        }
+        return;
+      }
+      REXKRNL_INFO("--online: answering QoS probes on UDP {}", kQosPort);
+      for (;;) {
+        uint8_t in[64];
+        sockaddr_in from{};
+#if REX_PLATFORM_WIN32
+        int from_len = sizeof(from);
+#else
+        socklen_t from_len = sizeof(from);
+#endif
+        const int got = int(::recvfrom(s, reinterpret_cast<char*>(in), sizeof(in), 0,
+                                       reinterpret_cast<sockaddr*>(&from), &from_len));
+        if (got < 12 || std::memcmp(in, "XQS?", 4) != 0) {
+          continue;
+        }
+        std::vector<uint8_t> out(in, in + 12);
+        std::memcpy(out.data(), "XQS!", 4);
+        {
+          std::lock_guard lock(g_online_mutex);
+          const auto it = g_qos_listeners.find(KidKey(in + 4));
+          if (it == g_qos_listeners.end() || !it->second.enabled) {
+            continue;
+          }
+          out.insert(out.end(), it->second.data.begin(), it->second.data.end());
+        }
+        ::sendto(s, reinterpret_cast<const char*>(out.data()), int(out.size()), 0,
+                 reinterpret_cast<sockaddr*>(&from), from_len);
+      }
+    }).detach();
+  });
+}
+}  // namespace
+
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
+  if (!OnlineStub()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if (!id) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const uint64_t key = KidKey(Bytes(id));
+  {
+    std::lock_guard lock(g_online_mutex);
+    if (flags & kQosListenRelease) {
+      g_qos_listeners.erase(key);
+    } else {
+      QosListener& listener = g_qos_listeners[key];
+      if (flags & kQosListenSetData) {
+        const uint8_t* bytes = Bytes(data);
+        listener.data.assign(bytes, bytes + (bytes ? data_size : 0));
+      }
+      if (flags & kQosListenEnable) {
+        listener.enabled = true;
+      }
+      if (flags & kQosListenDisable) {
+        listener.enabled = false;
+      }
+    }
+  }
+  REXKRNL_INFO("--online: QoS listen flags {:02X}, {} byte(s) of data", uint32_t(flags),
+               uint32_t(data_size));
+  StartQosResponder();
+  return 0;
+}
+
+// Probes each peer (and answers for each service) at once, on its own thread,
+// and fills the XNQOS the title polls; the event is set when all are in. A
+// peer that does not answer is still reported reachable, without data - an
+// older copy may simply not run the responder.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 xnaddr_count, mapped_u32 xnaddrs, mapped_u32 xnkids,
+                               mapped_u32 xnkeys, u32 service_count, mapped_u32 service_addrs,
+                               mapped_u32 service_ids, u32 probes, u32 bits_per_sec, u32 flags,
+                               u32 event_handle, mapped_u32 pqos) {
+  if (!OnlineStub()) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  const uint32_t count = xnaddr_count + service_count;
+  const uint32_t qos_size = 8 + std::max<uint32_t>(count, 1) * sizeof(XNQOSINFO);
+  const uint32_t qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(qos_size);
+  auto* qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+  std::memset(qos, 0, qos_size);
+  qos->count = count;
+  qos->count_pending = count;
+  if (pqos) {
+    *pqos = qos_guest;
+  }
+
+  struct Target {
+    uint32_t address = 0;
+    uint64_t kid = 0;
+  };
+  std::vector<Target> targets;
+  auto* memory = REX_KERNEL_MEMORY();
+  for (uint32_t i = 0; i < xnaddr_count; ++i) {
+    Target target;
+    const uint32_t xnaddr_guest = xnaddrs ? uint32_t(xnaddrs[i]) : 0;
+    if (xnaddr_guest) {
+      const auto* xnaddr = memory->TranslateVirtual<const XNADDR*>(xnaddr_guest);
+      target.address = xnaddr->ina.s_addr ? uint32_t(xnaddr->ina.s_addr)
+                                          : uint32_t(xnaddr->inaOnline.s_addr);
+    }
+    const uint32_t kid_guest = xnkids ? uint32_t(xnkids[i]) : 0;
+    if (kid_guest) {
+      target.kid = KidKey(memory->TranslateVirtual<const uint8_t*>(kid_guest));
+    }
+    targets.push_back(target);
+  }
+  REXKRNL_INFO("--online: QoS lookup of {} peer(s) and {} service(s)", uint32_t(xnaddr_count),
+               uint32_t(service_count));
+
+  std::thread([qos_guest, targets, count, event_handle] {
+    auto* memory = REX_KERNEL_MEMORY();
+    struct Result {
+      bool answered = false;
+      uint16_t rtt = 0;
+      std::vector<uint8_t> data;
+    };
+    std::vector<Result> results(targets.size());
+    const NativeSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (NativeValid(s)) {
+      sockaddr_in from_at{};
+      from_at.sin_family = AF_INET;
+      from_at.sin_addr.s_addr = BindAddress();
+      ::bind(s, reinterpret_cast<sockaddr*>(&from_at), sizeof(from_at));
+      const auto sent = std::chrono::steady_clock::now();
+      for (const Target& target : targets) {
+        if (!target.address) {
+          continue;
+        }
+        uint8_t probe[12];
+        std::memcpy(probe, "XQS?", 4);
+        std::memcpy(probe + 4, &target.kid, 8);
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(kQosPort);
+        to.sin_addr.s_addr = target.address;
+        ::sendto(s, reinterpret_cast<const char*>(probe), sizeof(probe), 0,
+                 reinterpret_cast<sockaddr*>(&to), sizeof(to));
+      }
+      const auto deadline = sent + std::chrono::milliseconds(600);
+      for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          break;
+        }
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(s, &readable);
+        const auto left =
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+        timeval wait{long(left / 1000000), long(left % 1000000)};
+        if (::select(int(s) + 1, &readable, nullptr, nullptr, &wait) <= 0) {
+          break;
+        }
+        uint8_t in[1500];
+        sockaddr_in from{};
+#if REX_PLATFORM_WIN32
+        int from_len = sizeof(from);
+#else
+        socklen_t from_len = sizeof(from);
+#endif
+        const int got = int(::recvfrom(s, reinterpret_cast<char*>(in), sizeof(in), 0,
+                                       reinterpret_cast<sockaddr*>(&from), &from_len));
+        if (got < 12 || std::memcmp(in, "XQS!", 4) != 0) {
+          continue;
+        }
+        const uint16_t rtt = uint16_t(std::max<int64_t>(
+            1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - sent)
+                   .count()));
+        for (size_t i = 0; i < targets.size(); ++i) {
+          if (!results[i].answered && targets[i].address == from.sin_addr.s_addr &&
+              targets[i].kid == KidKey(in + 4)) {
+            results[i].answered = true;
+            results[i].rtt = rtt;
+            results[i].data.assign(in + 12, in + got);
+            break;
+          }
+        }
+      }
+      CloseNative(s);
+    }
+
+    auto* qos = memory->TranslateVirtual<XNQOS*>(qos_guest);
+    for (uint32_t i = 0; i < count; ++i) {
+      XNQOSINFO& info = qos->info[i];
+      uint8_t info_flags = kQosInfoComplete | kQosInfoTargetContacted;
+      uint16_t rtt = 20;
+      if (i < results.size() && results[i].answered) {
+        rtt = results[i].rtt;
+        if (!results[i].data.empty()) {
+          const uint32_t data_guest = memory->SystemHeapAlloc(uint32_t(results[i].data.size()));
+          std::memcpy(memory->TranslateVirtual<uint8_t*>(data_guest), results[i].data.data(),
+                      results[i].data.size());
+          info.data_ptr = data_guest;
+          info.data_len = uint16_t(results[i].data.size());
+          info_flags |= kQosInfoDataReceived;
+        }
+      }
+      info.probes_xmit = 4;
+      info.probes_recv = 4;
+      info.rtt_min_in_msecs = rtt;
+      info.rtt_med_in_msecs = rtt;
+      info.up_bits_per_sec = 10'000'000;
+      info.down_bits_per_sec = 10'000'000;
+      info.flags = info_flags;
+    }
+    qos->count_pending = 0;
+    uint32_t answered = 0;
+    for (const Result& result : results) {
+      answered += result.answered ? 1 : 0;
+    }
+    REXKRNL_INFO("--online: QoS lookup done, {} of {} peer(s) answered", answered,
+                 uint32_t(targets.size()));
+    if (event_handle) {
+      if (auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle)) {
+        ev->Set(0, false);
+      }
+    }
+  }).detach();
+  return 0;
+}
+
+// Session keys. An online peer-to-peer key (XNKID's top bits 0x80, as
+// XNetXnKidIsOnlinePeer checks) with a random body; nothing is encrypted.
+u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
+  if (!OnlineStub()) {
+    return 1;
+  }
+  static std::mt19937_64 random{std::random_device{}()};
+  std::lock_guard lock(g_online_mutex);
+  if (xnkid) {
+    uint8_t* kid = Bytes(xnkid);
+    for (int i = 0; i < 8; ++i) {
+      kid[i] = uint8_t(random());
+    }
+    kid[0] = uint8_t((kid[0] & 0x0F) | 0x80);
+  }
+  if (xnkey) {
+    uint8_t* key = Bytes(xnkey);
+    for (int i = 0; i < 16; ++i) {
+      key[i] = uint8_t(random());
+    }
+  }
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
+  return OnlineStub() ? 0 : 1;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid) {
+  return OnlineStub() ? 0 : 1;
+}
+
+u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, u32 in_addr) {
+  return OnlineStub() ? 0 : 1;
+}
+
+// A title server's address as a secure-connection handle: the address itself.
+u32 NetDll_XNetServerToInAddr_entry(u32 caller, u32 in_addr, u32 service_id, mapped_u32 pina) {
+  if (!OnlineStub() || !pina) {
+    return 1;
+  }
+  *pina = in_addr;
+  return 0;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
@@ -786,6 +1257,12 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  // With an online_address set, a socket bound to "any address" is bound to
+  // that one instead: two copies on one machine, on 127.0.0.2 and 127.0.0.3,
+  // can then both have the title's fixed ports.
+  if (OnlineStub() && !REXCVAR_GET(online_address).empty() && native_name.sin_addr == 0u) {
+    native_name.sin_addr = ntohl(OnlineLocalAddress());
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -1228,7 +1705,7 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
@@ -1236,15 +1713,15 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
+REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
+REX_EXPORT(__imp__NetDll_XNetServerToInAddr, rex::kernel::xam::NetDll_XNetServerToInAddr_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr, rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);

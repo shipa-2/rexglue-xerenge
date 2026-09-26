@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
+#include <rex/kernel/xam/online.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -51,15 +52,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("CXLiveLogon::GetServiceInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
       if (OnlineStub() && buffer_length) {
         // XONLINE_SERVICE_INFO { dwServiceID, IN_ADDR serviceIP, WORD
-        // wServicePort, WORD reserved }: the service is on this machine.
-        // Titles that reach their own servers through Live (EA's DirtySock)
-        // refuse to go online while this fails.
+        // wServicePort, WORD reserved }: the service is wherever the title's
+        // side of --online says (a lobby server on this machine, on the LAN,
+        // or a self-hosted one). Titles that reach their own servers through
+        // Live (EA's DirtySock) refuse to go online while this fails.
+        const uint32_t address = OnlineServiceAddress();  // network order
+        const uint8_t* octets = reinterpret_cast<const uint8_t*>(&address);
         auto info = memory_->TranslateVirtual(buffer_length);
         memory::store_and_swap<uint32_t>(info + 0, buffer_ptr);
-        memory::store_and_swap<uint32_t>(info + 4, 0x7F000001);
+        memory::store_and_swap<uint32_t>(info + 4, uint32_t(octets[0]) << 24 |
+                                                       uint32_t(octets[1]) << 16 |
+                                                       uint32_t(octets[2]) << 8 | octets[3]);
         memory::store_and_swap<uint16_t>(info + 8, 3074);
         memory::store_and_swap<uint16_t>(info + 10, 0);
-        REXKRNL_INFO("--online: service {:08X} answered as 127.0.0.1:3074", buffer_ptr);
+        REXKRNL_INFO("--online: service {:08X} answered as {}.{}.{}.{}:3074", buffer_ptr,
+                     octets[0], octets[1], octets[2], octets[3]);
         return X_E_SUCCESS;
       }
       return 0x80151802;  // ERROR_CONNECTION_INVALID
