@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <random>
 #include <span>
 
 #include <rex/audio/audio_driver.h>
@@ -118,7 +120,10 @@ struct SwrContextCloser {
 };
 
 int ResolveSongIndex(const XmpApp::Playlist* playlist, uint32_t song_handle) {
-  if (!song_handle || !playlist || playlist->songs.empty()) {
+  if (!playlist || playlist->songs.empty()) {
+    return -1;
+  }
+  if (!song_handle) {
     return 0;
   }
   for (size_t i = 0; i < playlist->songs.size(); ++i) {
@@ -126,7 +131,7 @@ int ResolveSongIndex(const XmpApp::Playlist* playlist, uint32_t song_handle) {
       return int(i);
     }
   }
-  return 0;
+  return -1;
 }
 
 // Guest XAudio render buffers are 6-channel, 48 kHz, 256 samples per channel,
@@ -147,9 +152,11 @@ void WriteGuestAudioFrame(uint8_t* guest_frame, const float* stereo_interleaved,
 XmpApp::XmpApp(KernelState* kernel_state)
     : App(kernel_state, 0xFA),
       state_(State::kIdle),
-      playback_client_(PlaybackClient::kTitle),
-      playback_mode_(PlaybackMode::kUnknown),
-      repeat_mode_(RepeatMode::kUnknown),
+      xmp_client_(XmpClient::kGame),
+      playback_controller_(PlaybackController::kGame),
+      xmp_override_(false),
+      playback_mode_(PlaybackMode::kInOrder),
+      repeat_mode_(RepeatMode::kNoRepeat),
       unknown_flags_(0),
       volume_(1.0f),
       active_playlist_(nullptr),
@@ -172,6 +179,67 @@ void XmpApp::EnsureWorkerStarted() {
   worker_running_ = true;
   worker_thread_ = rex::thread::Thread::Create({}, [this] { WorkerThreadMain(); });
   worker_thread_->set_name("XMP Music Player");
+}
+
+bool XmpApp::IsTitleInPlaybackControl() const {
+  if (xmp_override_) {
+    return false;
+  }
+  // EA Trax and other in-title music UIs take kUser while previewing tracks.
+  if (playback_controller_ == PlaybackController::kUser) {
+    return true;
+  }
+  if (xmp_client_ == XmpClient::kMusicPlayer) {
+    return true;
+  }
+  return xmp_client_ == XmpClient::kGame && playback_controller_ == PlaybackController::kGame;
+}
+
+bool XmpApp::IsLastSongInPlaylist(const Playlist* playlist, int song_index) const {
+  return playlist && song_index >= 0 && song_index + 1 >= int(playlist->songs.size());
+}
+
+void XmpApp::AdvanceAfterSongFinished(Playlist* playlist, int finished_index) {
+  if (!playlist || finished_index < 0 || size_t(finished_index) >= playlist->songs.size()) {
+    return;
+  }
+  if (!IsLastSongInPlaylist(playlist, finished_index)) {
+    active_song_index_ = finished_index + 1;
+    active_song_handle_ = playlist->songs[active_song_index_]->handle;
+    active_file_path_.clear();
+    return;
+  }
+  if (repeat_mode_ == RepeatMode::kPlaylist) {
+    active_song_index_ = 0;
+    active_song_handle_ = playlist->songs.front()->handle;
+    active_file_path_.clear();
+    return;
+  }
+  state_ = State::kIdle;
+  active_song_handle_ = 0;
+  active_file_path_.clear();
+  OnStateChanged();
+}
+
+void XmpApp::SetActiveDriver(rex::audio::AudioDriver* driver) {
+  std::lock_guard<std::mutex> lock(active_driver_mutex_);
+  active_driver_ = driver;
+}
+
+void XmpApp::DiscardActiveDriverFrames() {
+  std::lock_guard<std::mutex> lock(active_driver_mutex_);
+  if (active_driver_) {
+    active_driver_->DiscardPendingFrames();
+  }
+}
+
+void XmpApp::OnPlaybackControlChanged() {
+  if (!IsTitleInPlaybackControl()) {
+    DiscardActiveDriverFrames();
+  } else if (state_ == State::kPlaying) {
+    resume_fence_.Signal();
+  }
+  kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, IsTitleInPlaybackControl());
 }
 
 bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song_index) {
@@ -278,6 +346,7 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
     vfs_file->Destroy();
     return false;
   }
+  SetActiveDriver(driver);
 
   uint32_t frame_addr = memory_->SystemHeapAlloc(kFrameBytes);
 
@@ -289,10 +358,10 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
   bool decode_error = false;
 
   auto submit_chunk = [&]() -> bool {
-    // Blocks for backpressure, and doubles as the pause gate: while paused,
-    // nothing is queued, so SDL plays silence rather than racing ahead to
-    // buffer the whole rest of the song.
-    while (state_ != State::kPlaying && !is_superseded()) {
+    // Blocks for backpressure, pause, and cutscenes that take playback control
+    // away from the title. While blocked, nothing new is queued; any frames
+    // already waiting in SDL are dropped when control is lost.
+    while ((state_ != State::kPlaying || !IsTitleInPlaybackControl()) && !is_superseded()) {
       resume_fence_.Wait();
     }
     if (is_superseded()) {
@@ -381,6 +450,7 @@ done_reading:
   }
 
   memory_->SystemHeapFree(frame_addr);
+  SetActiveDriver(nullptr);
   audio_system->DestroyHostDriver(driver);
   format_ctx.reset();
   free_avio();
@@ -395,6 +465,12 @@ void XmpApp::WorkerThreadMain() {
       resume_fence_.Wait();
       continue;
     }
+    while (state_ == State::kPlaying && !IsTitleInPlaybackControl()) {
+      resume_fence_.Wait();
+    }
+    if (state_ != State::kPlaying) {
+      continue;
+    }
     Playlist* playlist = active_playlist_;
     if (!playlist || playlist->songs.empty()) {
       state_ = State::kIdle;
@@ -403,22 +479,30 @@ void XmpApp::WorkerThreadMain() {
     int song_index = active_song_index_;
     auto utf8_path = rex::string::to_utf8(playlist->songs[song_index]->file_path);
     active_file_path_ = utf8_path;
+    active_song_handle_ = playlist->songs[song_index]->handle;
     REXKRNL_INFO("XMP: playing [{}] {}", song_index, utf8_path);
 
     bool ok = PlayFile(utf8_path, playlist, song_index);
     if (!ok) {
       REXKRNL_ERROR("XMP: playback failed for {}", utf8_path);
-      rex::thread::Sleep(std::chrono::seconds(1));
+      if (active_playlist_ == playlist && active_song_index_ == song_index &&
+          state_ == State::kPlaying) {
+        AdvanceAfterSongFinished(playlist, song_index);
+        if (state_ == State::kPlaying) {
+          resume_fence_.Signal();
+        }
+      }
       continue;
     }
 
-    // If nothing else touched playback while that song was decoding, it ended
-    // on its own: move on to the next song and keep the playlist going. A
-    // title that got this far wants continuous background music, not silence
-    // once the list is exhausted.
+    // Song ended naturally: advance through the carousel or stop, per repeat_mode_.
     if (active_playlist_ == playlist && active_song_index_ == song_index &&
-        state_ == State::kPlaying) {
-      active_song_index_ = (song_index + 1) % int(playlist->songs.size());
+        state_ == State::kPlaying && IsTitleInPlaybackControl()) {
+      AdvanceAfterSongFinished(playlist, song_index);
+      if (state_ == State::kPlaying) {
+        OnStateChanged();
+        kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+      }
     }
   }
 }
@@ -475,6 +559,10 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
       }
       playlist->songs.emplace_back(std::move(song));
     }
+    if (playback_mode_ == PlaybackMode::kShuffle && playlist->songs.size() > 1) {
+      auto rng = std::default_random_engine{};
+      std::shuffle(playlist->songs.begin(), playlist->songs.end(), rng);
+    }
   }
   if (out_playlist_handle) {
     memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(out_playlist_handle),
@@ -517,12 +605,6 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
     playlist = it->second;
   }
 
-  // Burnout Revenge (and evidently other titles) sets PlaybackClient::kSystem
-  // and then still expects its own playlist to play - on real hardware that
-  // flag arbitrates with the dashboard's own "system" music, which this
-  // runtime has none of, so returning early here left every title with a
-  // licensed soundtrack silent regardless of what it asked to play.
-  //
   // This call is not necessarily a one-shot "start the music" - Burnout
   // Revenge calls it many times a second, apparently to assert "this playlist
   // should be playing" rather than to mean "start over". The stub this
@@ -540,14 +622,23 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   const auto target_path = rex::string::to_utf8(playlist->songs[target_index]->file_path);
   if (state_ == State::kPlaying && target_index == active_song_index_ &&
       target_path == active_file_path_) {
+    // Nothing changes, so nothing is announced. Every one of these calls used
+    // to queue a state-change and a behaviour-change notification; the title
+    // takes one notification a frame off its listener, so the queue only ever
+    // grew, and the one that mattered - the song having stopped, at its end or
+    // after the title's own XMPStop for a skip - sat behind hundreds of stale
+    // ones. The next song was never started.
     active_playlist_ = playlist;
-    OnStateChanged();
-    kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+    active_song_handle_ = playlist->songs[target_index]->handle;
     return X_E_SUCCESS;
   }
+  REXKRNL_INFO("XMP: title plays playlist {:08X} song [{}] {}", playlist_handle, target_index,
+               target_path);
   EnsureWorkerStarted();
   active_playlist_ = playlist;
   active_song_index_ = target_index;
+  active_song_handle_ = playlist->songs[target_index]->handle;
+  active_file_path_.clear();
   state_ = State::kPlaying;
   resume_fence_.Signal();
   OnStateChanged();
@@ -567,9 +658,11 @@ X_HRESULT XmpApp::XMPContinue() {
 
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
-  REXKRNL_DEBUG("XMPStop({:08X})", unk);
+  REXKRNL_INFO("XMP: title stops playback");
+  DiscardActiveDriverFrames();
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
+  active_song_handle_ = 0;
   active_file_path_.clear();
   state_ = State::kIdle;
   resume_fence_.Signal();
@@ -581,6 +674,7 @@ X_HRESULT XmpApp::XMPPause() {
   REXKRNL_DEBUG("XMPPause()");
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
+    DiscardActiveDriverFrames();
   }
   OnStateChanged();
   return X_E_SUCCESS;
@@ -588,11 +682,17 @@ X_HRESULT XmpApp::XMPPause() {
 
 X_HRESULT XmpApp::XMPNext() {
   REXKRNL_DEBUG("XMPNext()");
-  if (!active_playlist_) {
+  if (!active_playlist_ || active_playlist_->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
-  active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
+  if (!IsLastSongInPlaylist(active_playlist_, active_song_index_)) {
+    active_song_index_ += 1;
+  } else {
+    active_song_index_ = 0;
+  }
+  active_song_handle_ = active_playlist_->songs[active_song_index_]->handle;
+  active_file_path_.clear();
   resume_fence_.Signal();
   OnStateChanged();
   return X_E_SUCCESS;
@@ -600,22 +700,30 @@ X_HRESULT XmpApp::XMPNext() {
 
 X_HRESULT XmpApp::XMPPrevious() {
   REXKRNL_DEBUG("XMPPrevious()");
-  if (!active_playlist_) {
+  if (!active_playlist_ || active_playlist_->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
-  if (!active_song_index_) {
+  if (active_song_index_ <= 0) {
     active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
   } else {
     --active_song_index_;
   }
+  active_song_handle_ = active_playlist_->songs[active_song_index_]->handle;
+  active_file_path_.clear();
   resume_fence_.Signal();
   OnStateChanged();
   return X_E_SUCCESS;
 }
 
 void XmpApp::OnStateChanged() {
-  kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
+  // Only a real change is announced, as the console does.
+  const uint32_t state = static_cast<uint32_t>(state_);
+  if (state == last_announced_state_.exchange(state)) {
+    return;
+  }
+  REXKRNL_INFO("XMP: state now {}", state);
+  kernel_state_->BroadcastNotification(kMsgStateChanged, state);
 }
 
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
@@ -675,8 +783,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       static_assert_size(decltype(*args), 16);
 
       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
-      REXKRNL_DEBUG("XMPSetPlaybackBehavior({:08X}, {:08X}, {:08X})", uint32_t(args->playback_mode),
-                    uint32_t(args->repeat_mode), uint32_t(args->flags));
+      REXKRNL_INFO("XMP: playback behaviour mode {} repeat {} flags {:08X}",
+                   uint32_t(args->playback_mode), uint32_t(args->repeat_mode),
+                   uint32_t(args->flags));
       playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
       repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
       unknown_flags_ = args->flags;
@@ -794,18 +903,26 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(!buffer_length || buffer_length == 12);
       struct {
         rex::be<uint32_t> xmp_client;
-        rex::be<uint32_t> controller;
-        rex::be<uint32_t> playback_client;
+        rex::be<uint32_t> playback_controller_request;
+        rex::be<uint32_t> playback_controller_locked;
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
-      assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
-                  (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
-      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
-                    uint32_t(args->playback_client));
+      REXKRNL_DEBUG("XMPSetPlaybackController(client={:08X}, controller={:08X}, locked={:08X})",
+                    uint32_t(args->xmp_client), uint32_t(args->playback_controller_request),
+                    uint32_t(args->playback_controller_locked));
 
-      playback_client_ = PlaybackClient(uint32_t(args->playback_client));
-      kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
+      if (static_cast<PlaybackController>(uint32_t(args->playback_controller_request)) ==
+          PlaybackController::kRestore) {
+        xmp_client_ = XmpClient::kGame;
+        playback_controller_ = PlaybackController::kGame;
+      } else {
+        xmp_client_ = static_cast<XmpClient>(uint32_t(args->xmp_client));
+        playback_controller_ =
+            static_cast<PlaybackController>(uint32_t(args->playback_controller_request));
+      }
+      xmp_override_ = args->playback_controller_locked != 0;
+      OnPlaybackControlChanged();
       return X_E_SUCCESS;
     }
     case 0x0007001B: {
@@ -813,16 +930,20 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(!buffer_length || buffer_length == 12);
       struct {
         rex::be<uint32_t> xmp_client;
-        rex::be<uint32_t> controller_ptr;
-        rex::be<uint32_t> locked_ptr;
+        rex::be<uint32_t> playback_controller_ptr;
+        rex::be<uint32_t> playback_controller_locked_ptr;
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
-                    uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
+                    uint32_t(args->playback_controller_ptr),
+                    uint32_t(args->playback_controller_locked_ptr));
+      memory::store_and_swap<uint32_t>(
+          memory_->TranslateVirtual(args->playback_controller_ptr),
+          static_cast<uint32_t>(playback_controller_));
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->playback_controller_locked_ptr),
+                                         IsTitleInPlaybackControl() ? 0u : 1u);
 
       if (!XThread::GetCurrentThread()->main_thread()) {
         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.

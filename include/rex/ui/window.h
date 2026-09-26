@@ -293,6 +293,12 @@ class Window {
   /// Returns the platform-native window handle (HWND on Windows), or nullptr.
   /// Valid after Open() returns successfully.
   virtual void* GetNativeWindowHandle() const { return nullptr; }
+  // SDL_Window* for plume/Vulkan swapchains when the backend is SDL-based.
+  virtual void* GetSDLWindowForVulkan() const { return nullptr; }
+
+  // Must be set before Open() when using a Vulkan/plume presentation backend.
+  void SetWantsVulkanWindow(bool wants) { wants_vulkan_window_ = wants; }
+  bool wants_vulkan_window() const { return wants_vulkan_window_; }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
@@ -738,6 +744,8 @@ class Window {
   // complex than just a small state update, and recursive painting is
   // completely unsupported by the Presenter.
   bool is_painting_ = false;
+
+  bool wants_vulkan_window_ = false;
 };
 
 }  // namespace ui

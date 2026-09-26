@@ -334,7 +334,17 @@ void VdGetSystemCommandBuffer_entry(mapped_void p0_ptr, mapped_void p1_ptr) {
 }
 
 void VdSetSystemCommandBufferGpuIdentifierAddress_entry(mapped_void unk) {
-  // r3 = 0x2B10(d3d?) + 8
+  // The title is handing over the address at which the GPU is expected to
+  // publish how far it has got through the command buffer. It polls that
+  // location to work out whether there is room to submit more work, so a
+  // backend that never writes it leaves the title waiting for space that, as
+  // far as it can see, never frees up.
+  const uint32_t address = unk.guest_address();
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    REXKRNL_INFO("VdSetSystemCommandBufferGpuIdentifierAddress: {:08X}", address);
+  }
 }
 
 // VdVerifyMEInitCommand
@@ -415,6 +425,10 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
   return 0;
 }
 
+namespace {
+std::atomic<uint64_t> g_vdswap_ns{0};
+}  // namespace
+
 void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                   mapped_void unk2,            // system writeback ptr
@@ -423,6 +437,38 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  // Whether the title is still asking for frames at all. Entering a scene it
+  // stops calling Direct3D's own Swap, and the screen freezes - so the first
+  // thing to establish is whether the request stops here too or only further
+  // down.
+  {
+    static std::atomic<uint64_t> swaps{0};
+    static std::atomic<uint64_t> last_ms{0};
+    const uint64_t n = swaps.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    uint64_t was = last_ms.load(std::memory_order_relaxed);
+    if (now - was >= 2000 && last_ms.compare_exchange_strong(was, now)) {
+      REXLOG_INFO("kernel: VdSwap called {} time(s) so far, {} ms spent inside", n,
+                  g_vdswap_ns.load(std::memory_order_relaxed) / 1000000);
+    }
+  }
+  // How much of the title's time this call itself takes. In a scene the title
+  // finishes only half a frame a second while waiting on nothing the device
+  // offers, so the remaining candidate is that it is waiting here - for the
+  // previous frame to finish being encoded.
+  struct SwapTimer {
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    ~SwapTimer() {
+      g_vdswap_ns.fetch_add(static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - started)
+                                    .count()),
+                            std::memory_order_relaxed);
+    }
+  } swap_timer;
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
@@ -430,6 +476,29 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert(texture_format_ptr);
   assert(width);
   assert(height);
+
+  // Presenting here and filling the reservation with no-ops leaves the command
+  // ring without the swap packet the title's own Direct3D layer expects to see
+  // consumed. The backend that renders these screens does it the other way:
+  // the packet goes into the ring like any other, and the frame appears when
+  // the command processor reaches it. Keep the old behaviour available, since
+  // it is what every screen up to now was brought up on.
+  // Two separate things, and only one of them was wrong. The swap packet does
+  // belong in the ring - the title's Direct3D layer expects to see it consumed
+  // - but moving the present itself onto that packet changed the frame pacing
+  // and left the title waiting on a menu. So write the packet below, and keep
+  // presenting from here where it has always worked.
+  static const bool present_on_packet = std::getenv("XERENGE_PRESENT_ON_SWAP") != nullptr;
+  if (auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system();
+      !present_on_packet && graphics_system &&
+      graphics_system->uses_direct_presentation()) {
+    // Present here, where it works - but do not return. Returning skipped the
+    // reservation the caller made for the swap packet, so the command stream
+    // never carried one: measured against the reference backend on the same
+    // route, it executes 1382 swap packets where this path produced none, one
+    // per frame. Fall through and write the same packets the path below does.
+    graphics_system->PresentGuestFrame(*width, *height);
+  }
 
   namespace xenos = rex::graphics::xenos;
 

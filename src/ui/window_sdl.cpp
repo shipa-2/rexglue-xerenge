@@ -22,6 +22,8 @@
 #include <utf8.h>
 
 #include <rex/cvar.h>
+#include <rex/ui/window.h>
+
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -110,6 +112,9 @@ bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
   // uses logical points and applies the backing scale itself.
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+  if (wants_vulkan_window()) {
+    flags |= SDL_WINDOW_VULKAN;
+  }
 #if REX_PLATFORM_MAC
   int initial_width = int(GetDesiredLogicalWidth());
   int initial_height = int(GetDesiredLogicalHeight());
@@ -199,6 +204,10 @@ void WindowSDL::DestroySDLWindow() {
     sdl_window_ = nullptr;
     sdl_window_id_ = 0;
   }
+}
+
+void* WindowSDL::GetSDLWindowForVulkan() const {
+  return sdl_window_;
 }
 
 void* WindowSDL::GetNativeWindowHandle() const {

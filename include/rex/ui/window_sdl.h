@@ -32,6 +32,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  void* GetSDLWindowForVulkan() const override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
   bool GetDisplayPixelSize(uint32_t& width, uint32_t& height) const override;

@@ -483,6 +483,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // The name is not needed once the descriptor exists - every view is mapped
+  // from the descriptor - so drop it now. Left in place it outlives any exit
+  // that skips CloseFileMappingHandle: each hard exit leaked the whole guest
+  // arena into /dev/shm, and once that filled up the next run died of SIGBUS
+  // touching its own memory, mid-frame, which hung the GPU.
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }

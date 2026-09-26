@@ -70,11 +70,13 @@ VirtualKey TranslateSDLScancode(SDL_Scancode scancode) {
     case SDL_SCANCODE_DELETE:
       return VirtualKey::kDelete;
     case SDL_SCANCODE_LSHIFT:
+      return VirtualKey::kLShift;
     case SDL_SCANCODE_RSHIFT:
-      return VirtualKey::kShift;
+      return VirtualKey::kRShift;
     case SDL_SCANCODE_LCTRL:
+      return VirtualKey::kLControl;
     case SDL_SCANCODE_RCTRL:
-      return VirtualKey::kControl;
+      return VirtualKey::kRControl;
     case SDL_SCANCODE_LALT:
     case SDL_SCANCODE_RALT:
       return VirtualKey::kMenu;

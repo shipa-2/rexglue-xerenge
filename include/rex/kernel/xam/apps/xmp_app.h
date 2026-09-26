@@ -21,10 +21,32 @@
 #include <rex/thread.h>
 #include <rex/thread/mutex.h>
 
+namespace rex::audio {
+class AudioDriver;
+}
+
 namespace rex {
 namespace kernel {
 namespace xam {
 namespace apps {
+
+enum class XmpClient : uint32_t {
+  kDash = 0,
+  kHud = 1,
+  kGame = 2,
+  kRemote = 3,
+  kMusicPlayer = 4,
+  kMsal = 5,
+  kMce = 6,
+};
+
+enum class PlaybackController : uint32_t {
+  kGame = 0,
+  kUser = 1,
+  kDash = 2,
+  kMce = 3,
+  kRestore = 4,
+};
 
 // Only source of docs for a lot of these functions:
 // https://github.com/oukiar/freestyledash/blob/master/Freestyle/Scenes/Media/Music/ScnMusic.cpp
@@ -36,17 +58,13 @@ class XmpApp : public system::xam::App {
     kPlaying = 1,
     kPaused = 2,
   };
-  enum class PlaybackClient : uint32_t {
-    kSystem = 0,
-    kTitle = 1,
-  };
   enum class PlaybackMode : uint32_t {
-    // kInOrder = ?,
-    kUnknown = 0,
+    kInOrder = 0,
+    kShuffle = 1,
   };
   enum class RepeatMode : uint32_t {
-    // kNoRepeat = ?,
-    kUnknown = 0,
+    kPlaylist = 0,
+    kNoRepeat = 1,
   };
   struct Song {
     enum class Format : uint32_t {
@@ -106,22 +124,32 @@ class XmpApp : public system::xam::App {
   bool PlayFile(const std::string& utf8_path, Playlist* playlist, int song_index);
   // Waits for something to play, plays the active playlist starting at
   // active_song_index_, and on a song ending on its own (PlayFile returned
-  // true and nothing else changed underneath it) advances to the next song
-  // and loops the playlist - titles that reach this point want continuous
-  // background music, not two minutes of silence once the list runs out.
+  // true and nothing else changed underneath it) advances per repeat_mode_.
   void WorkerThreadMain();
+  bool IsLastSongInPlaylist(const Playlist* playlist, int song_index) const;
+  void AdvanceAfterSongFinished(Playlist* playlist, int finished_index);
   // Starts the worker thread on first real use rather than at construction -
   // see the constructor for why.
   void EnsureWorkerStarted();
+  bool IsTitleInPlaybackControl() const;
+  void OnPlaybackControlChanged();
+  void DiscardActiveDriverFrames();
+  void SetActiveDriver(rex::audio::AudioDriver* driver);
 
   State state_;
-  PlaybackClient playback_client_;
+  // The state last announced to the title (kMsgStateChanged); only a change
+  // from it is broadcast.
+  std::atomic<uint32_t> last_announced_state_{0xFFFFFFFFu};
+  XmpClient xmp_client_;
+  PlaybackController playback_controller_;
+  bool xmp_override_;
   PlaybackMode playback_mode_;
   RepeatMode repeat_mode_;
   uint32_t unknown_flags_;
   float volume_;
   Playlist* active_playlist_;
   int active_song_index_;
+  uint32_t active_song_handle_ = 0;
   // What PlayFile is decoding right now. Compared on XMPPlayTitlePlaylist so a
   // title that recreates its playlist handle every frame while previewing a
   // track does not restart decode when the underlying file did not change.
@@ -132,14 +160,18 @@ class XmpApp : public system::xam::App {
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
 
-  // The decode thread and its own idle/pause wait. There is deliberately no
-  // driver_/driver_mutex_ member: PlayFile owns its AudioDriver locally for
-  // the run of one song, and volume/pause are applied by the decode loop
-  // itself (reading volume_/state_ each frame) rather than by reaching into
-  // the driver from another thread.
+  // The decode thread and its own idle/pause wait.
   std::atomic<bool> worker_running_ = {false};
   std::unique_ptr<rex::thread::Thread> worker_thread_;
   rex::thread::Fence resume_fence_;
+
+  // The AudioDriver PlayFile currently owns, if any - set only so
+  // DiscardActiveDriverFrames (called from whichever thread dispatches
+  // XMPSetPlaybackController) can drop queued frames when the title loses
+  // playback control, without reaching across threads into PlayFile's own
+  // locals.
+  std::mutex active_driver_mutex_;
+  rex::audio::AudioDriver* active_driver_ = nullptr;
 };
 
 }  // namespace apps

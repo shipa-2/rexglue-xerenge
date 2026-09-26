@@ -13,6 +13,10 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -802,6 +806,34 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
+    }
+  }
+
+  // A packet-by-packet journal, so what this backend executes can be compared
+  // against what another one does on the same route. Nothing is written unless
+  // asked for, and the format is deliberately plain: one line per type-3
+  // packet, opcode and payload length, which is enough to find the first place
+  // two backends diverge.
+  {
+    static const bool tracing = std::getenv("XERENGE_PM4_TRACE") != nullptr;
+    if (tracing) {
+      static std::atomic<uint64_t> per_opcode[128];
+      static std::atomic<uint64_t> last_ms{0};
+      per_opcode[opcode & 0x7F].fetch_add(1, std::memory_order_relaxed);
+      const uint64_t now = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+      uint64_t was = last_ms.load(std::memory_order_relaxed);
+      if (now - was >= 5000 && last_ms.compare_exchange_strong(was, now)) {
+        std::string census;
+        for (uint32_t i = 0; i < 128; ++i) {
+          const uint64_t n = per_opcode[i].load(std::memory_order_relaxed);
+          if (n != 0) {
+            census += fmt::format(" {:02X}={}", i, n);
+          }
+        }
+        REXGPU_INFO("xenos packets:{}", census);
+      }
     }
   }
 

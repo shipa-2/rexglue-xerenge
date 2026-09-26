@@ -30,32 +30,33 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
 
-REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
-REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
-REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
+REXCVAR_DEFINE_STRING(keybind_a, "LShift", "Input/Keybinds/Controller", "A button");
+REXCVAR_DEFINE_STRING(keybind_b, "Space", "Input/Keybinds/Controller", "B button");
+REXCVAR_DEFINE_STRING(keybind_x, "Q", "Input/Keybinds/Controller", "X button");
 REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button");
-REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger");
-REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger");
+REXCVAR_DEFINE_STRING(keybind_left_trigger, "LControl", "Input/Keybinds/Controller",
+                      "Left trigger");
+REXCVAR_DEFINE_STRING(keybind_right_trigger, "W", "Input/Keybinds/Controller", "Right trigger");
 REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder");
 REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder");
-REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
+REXCVAR_DEFINE_STRING(keybind_lstick_up, "", "Input/Keybinds/Controller", "Left stick up");
 REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down");
-REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
-REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
+REXCVAR_DEFINE_STRING(keybind_lstick_left, "A,Left", "Input/Keybinds/Controller",
+                      "Left stick left");
+REXCVAR_DEFINE_STRING(keybind_lstick_right, "D,Right", "Input/Keybinds/Controller",
+                      "Left stick right");
 REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press");
-REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up");
-REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down");
-REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left");
-REXCVAR_DEFINE_STRING(keybind_rstick_right, "Right", "Input/Keybinds/Controller",
-                      "Right stick right");
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "", "Input/Keybinds/Controller", "Right stick up");
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "", "Input/Keybinds/Controller", "Right stick down");
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "", "Input/Keybinds/Controller", "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_rstick_right, "", "Input/Keybinds/Controller", "Right stick right");
 REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press");
-REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up");
-REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down");
-REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left");
-REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller",
-                      "D-pad right");
+REXCVAR_DEFINE_STRING(keybind_dpad_up, "Up", "Input/Keybinds/Controller", "D-pad up");
+REXCVAR_DEFINE_STRING(keybind_dpad_down, "Down", "Input/Keybinds/Controller", "D-pad down");
+REXCVAR_DEFINE_STRING(keybind_dpad_left, "A,Left", "Input/Keybinds/Controller", "D-pad left");
+REXCVAR_DEFINE_STRING(keybind_dpad_right, "D,Right", "Input/Keybinds/Controller", "D-pad right");
 REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button");
-REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
+REXCVAR_DEFINE_STRING(keybind_start, "Escape,Enter", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
 
 namespace rex::input::mnk {
@@ -77,9 +78,13 @@ constexpr uint8_t kModAlt = 1u << 2;
 
 uint8_t LiveModifiers(const bool (&key_down)[256]) {
   uint8_t mods = 0;
-  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kShift)])
+  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kShift)] ||
+      key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kLShift)] ||
+      key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kRShift)])
     mods |= kModShift;
-  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kControl)])
+  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kControl)] ||
+      key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kLControl)] ||
+      key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kRControl)])
     mods |= kModCtrl;
   if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kMenu)])
     mods |= kModAlt;

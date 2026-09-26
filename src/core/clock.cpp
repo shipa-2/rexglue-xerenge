@@ -242,3 +242,10 @@ void Clock::ScaleGuestDurationTimeval(int32_t* tv_sec, int32_t* tv_usec) {
 }
 
 }  // namespace rex::chrono
+
+// A title's frame clock, for a renderer plugin: set by the title's own code,
+// read by the plugin. Both link this library, and neither can see the other's
+// symbols, so the pointer lives here. See game_timing.cpp in the Burnout
+// project for the one that sets it.
+extern "C" __attribute__((visibility("default"))) void (*rex_frame_clock_provider)(void*,
+                                                                                size_t) = nullptr;

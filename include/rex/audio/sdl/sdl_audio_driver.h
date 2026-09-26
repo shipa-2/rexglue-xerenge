@@ -29,6 +29,7 @@ class SDLAudioDriver : public AudioDriver {
 
   bool Initialize();
   void SubmitFrame(uint32_t frame_ptr) override;
+  void DiscardPendingFrames() override;
   void Shutdown();
 
  protected:

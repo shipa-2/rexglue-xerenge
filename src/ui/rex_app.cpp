@@ -11,6 +11,9 @@
 
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include <string>
+#include <unistd.h>
 #include <rex/rex_app.h>
 
 #include <cstdlib>
@@ -49,8 +52,14 @@
 #include <string_view>
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
-                      "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
-                      "GPU emulation")
+                      "GPU plugin to load at startup (e.g. 'xenos', 'plume'); empty uses "
+                      "gpu_backend")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(gpu_backend, "xenos", "GPU",
+                      "Default GPU backend when gpu_plugin is empty: xenos (PM4 emulation) or "
+                      "plume (D3D hook path)")
+    .allowed({"xenos", "plume"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -305,6 +314,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
 bool ReXApp::SetupPresentation() {
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
+  if (config_.gpu_plugin.empty()) {
+    config_.gpu_plugin = REXCVAR_GET(gpu_backend);
+  }
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
@@ -345,6 +357,9 @@ bool ReXApp::SetupPresentation() {
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
 
+  if (config_.gpu_plugin == "plume") {
+    window_->SetWantsVulkanWindow(true);
+  }
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
   }
@@ -356,6 +371,10 @@ bool ReXApp::SetupPresentation() {
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();
+  if (graphics_system) {
+    graphics_system->AttachPresentationWindow(window_.get());
+  }
+
   if (graphics_system && graphics_system->presenter()) {
     // SDK mode: the emulated-Xenos presenter drives the overlays.
     auto* presenter = graphics_system->presenter();
@@ -414,6 +433,32 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
+  // A picture of the window, taken on request. Describing a broken frame in
+  // words loses most of what matters about it; a file in logs/shots does not.
+  // F12 is left alone - RenderDoc's overlay already uses it.
+  //
+  // The capture goes through the window system rather than the swapchain, so
+  // it shows exactly what is on screen, and it runs on its own thread so the
+  // frame being captured is not held up by the capture.
+  rex::ui::RegisterBind("bind_screenshot", "F9", "Save a screenshot to logs/shots", [] {
+    static std::atomic<uint32_t> taken{0};
+    const uint32_t n = taken.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const std::string path = "logs/shots/shot-" + std::to_string(stamp) + ".png";
+    const std::string command =
+        "mkdir -p logs/shots && import -window \"$(xdotool search --pid " +
+        std::to_string(::getpid()) + " | tail -1)\" '" + path + "' 2>/dev/null";
+    std::thread([command, path, n] {
+      const int status = std::system(command.c_str());
+      if (status == 0) {
+        REXLOG_INFO("screenshot #{} saved to {}", n, path);
+      } else {
+        REXLOG_WARN("screenshot #{} failed (import/xdotool status {})", n, status);
+      }
+    }).detach();
+  });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
@@ -426,6 +471,29 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
 }
 
 void ReXApp::LaunchModule() {
+  // An unattended run has to end the way closing the window ends it. Killing
+  // the process from outside lands mid-frame, with work still queued on the
+  // GPU and nothing to retire it, and that wedges the device for the whole
+  // machine rather than just this process. Arm the normal closing path on a
+  // timer instead, so a timed run shuts down exactly like a manual one.
+  if (const char* seconds = std::getenv("XERENGE_RUN_SECONDS")) {
+    const unsigned long run_for = std::strtoul(seconds, nullptr, 10);
+    if (run_for != 0) {
+      std::thread([this, run_for] {
+        std::this_thread::sleep_for(std::chrono::seconds(run_for));
+        if (shutting_down_.load(std::memory_order_acquire)) {
+          return;
+        }
+        REXLOG_INFO("XERENGE_RUN_SECONDS={} elapsed; closing as if the window were closed",
+                    run_for);
+        app_context().CallInUIThreadDeferred([this] {
+          ui::UIEvent e(nullptr);
+          OnClosing(e);
+        });
+      }).detach();
+    }
+  }
+
   app_context().CallInUIThreadDeferred([this]() {
     // Register the achievement notification callback now that the runtime and
     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)

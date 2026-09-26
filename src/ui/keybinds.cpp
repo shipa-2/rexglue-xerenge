@@ -98,6 +98,7 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     // Control
     {"Escape", VirtualKey::kEscape},
     {"Return", VirtualKey::kReturn},
+    {"Enter", VirtualKey::kReturn},
     {"Space", VirtualKey::kSpace},
     {"Tab", VirtualKey::kTab},
     {"Backspace", VirtualKey::kBack},
@@ -114,7 +115,12 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"Down", VirtualKey::kDown},
     // Modifier
     {"Shift", VirtualKey::kShift},
+    {"LShift", VirtualKey::kLShift},
+    {"RShift", VirtualKey::kRShift},
     {"Control", VirtualKey::kControl},
+    {"Ctrl", VirtualKey::kLControl},
+    {"LControl", VirtualKey::kLControl},
+    {"RControl", VirtualKey::kRControl},
     {"Alt", VirtualKey::kMenu},
     // Numpad
     {"Numpad0", VirtualKey::kNumpad0},

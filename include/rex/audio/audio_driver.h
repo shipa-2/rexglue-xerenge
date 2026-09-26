@@ -23,6 +23,10 @@ class AudioDriver {
 
   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
 
+  // Drops frames queued for output but not yet played, returning producer
+  // credits. Used when XMP pauses or the title loses playback control.
+  virtual void DiscardPendingFrames() {}
+
  protected:
   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {
     return memory_->TranslatePhysical(guest_address);
