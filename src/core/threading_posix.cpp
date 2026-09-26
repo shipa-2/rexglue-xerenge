@@ -414,8 +414,14 @@ class PosixConditionBase {
       if (timeout == std::chrono::milliseconds::max()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+        // The remainder as it is, not cut to whole milliseconds: an alertable
+        // wait comes here in 1 ms slices, so the remainder is always under a
+        // millisecond, and cut down it was zero - every thread in an
+        // alertable multi-wait (the audio worker among them) spun a whole
+        // core instead of sleeping.
+        const auto remaining = end_time - now;
+        const auto sleep_time =
+            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1));
         std::this_thread::sleep_for(sleep_time);
       }
     }

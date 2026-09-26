@@ -28,6 +28,12 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
+
+#include <atomic>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
@@ -547,6 +553,27 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+#if defined(__linux__)
+    // Once per process, the host stack: the recompiled code runs as native
+    // functions named after their guest address (sub_XXXXXXXX), so this says
+    // which guest function faulted. Frames are "module+offset", for addr2line.
+    static std::atomic<bool> stack_logged{false};
+    if (!stack_logged.exchange(true)) {
+      void* frames[40];
+      const int count = backtrace(frames, 40);
+      for (int i = 0; i < count; ++i) {
+        Dl_info info{};
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+          REXSYS_ERROR("  #{} {}+0x{:X} ({})", i, info.dli_fname,
+                       reinterpret_cast<uintptr_t>(frames[i]) -
+                           reinterpret_cast<uintptr_t>(info.dli_fbase),
+                       info.dli_sname ? info.dli_sname : "?");
+        } else {
+          REXSYS_ERROR("  #{} {}", i, frames[i]);
+        }
+      }
+    }
+#endif
     return false;
   }
 
