@@ -26,7 +26,9 @@
 #include <WS2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
@@ -96,6 +98,41 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
 }
 
 X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+  // The title's codes are WinSock's and its argument a big-endian u_long. On
+  // POSIX the codes differ (FIONBIO 0x5421), so the raw call failed: a socket
+  // the title made non-blocking stayed blocking, and the lobby's first recv
+  // with nothing to read froze the title until the peer went away.
+  constexpr uint32_t kWsaFionbio = 0x8004667E;
+  constexpr uint32_t kWsaFionread = 0x4004667F;
+  if (cmd == kWsaFionbio && arg_ptr) {
+    uint32_t value;
+    std::memcpy(&value, arg_ptr, sizeof(value));
+#if REX_PLATFORM_WIN32
+    u_long enable = value ? 1 : 0;
+    const int ret = ioctlsocket(SOCKET(native_handle_), FIONBIO, &enable);
+#else
+    const int flags = fcntl(int(native_handle_), F_GETFL, 0);
+    const int ret = flags < 0 ? -1
+                              : fcntl(int(native_handle_), F_SETFL,
+                                      value ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+#endif
+    return ret < 0 ? X_STATUS_UNSUCCESSFUL : X_STATUS_SUCCESS;
+  }
+  if (cmd == kWsaFionread && arg_ptr) {
+#if REX_PLATFORM_WIN32
+    u_long available = 0;
+    const int ret = ioctlsocket(SOCKET(native_handle_), FIONREAD, &available);
+#else
+    int available = 0;
+    const int ret = ioctl(int(native_handle_), FIONREAD, &available);
+#endif
+    if (ret < 0) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    const uint32_t value = rex::byte_swap(uint32_t(available));
+    std::memcpy(arg_ptr, &value, sizeof(value));
+    return X_STATUS_SUCCESS;
+  }
   int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
   if (ret < 0) {
     // TODO: Get last error

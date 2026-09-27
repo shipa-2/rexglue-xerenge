@@ -1283,6 +1283,11 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
   }
 
   X_STATUS status = socket->IOControl(cmd, arg_ptr);
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: ioctl socket {:08X} cmd {:08X} arg {:08X}{}", socket_handle, cmd,
+                 arg_ptr ? rex::byte_swap(*static_cast<const uint32_t*>(arg_ptr.host_address())) : 0u,
+                 XFAILED(status) ? " (failed)" : "");
+  }
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;

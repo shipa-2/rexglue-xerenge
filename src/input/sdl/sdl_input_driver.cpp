@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <array>
 #include <filesystem>
 
@@ -575,6 +576,16 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     return;
   }
   auto xbutton = xbutton_lookup.at(event.gbutton.button);
+  // The first few button events a session sees, as SDL gave them: a press
+  // nobody made at startup has to be told apart from a real one.
+  {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+      REXLOG_INFO("SDL button event: SDL button {} {} (timestamp {} ns) -> XInput {:04X}",
+                  uint32_t(event.gbutton.button), event.gbutton.down ? "down" : "up",
+                  uint64_t(event.gbutton.timestamp), uint32_t(xbutton));
+    }
+  }
   // Pressed or released?
   if (event.gbutton.down) {
     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
