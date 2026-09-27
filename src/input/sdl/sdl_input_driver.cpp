@@ -197,7 +197,18 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   auto is_active = this->is_active();
 
   if (is_active) {
-    QueueControllerUpdate();
+    // Use a synchronous pump so SDL events (including button presses queued
+    // since the last poll) are processed *before* we read the controller
+    // state below.  The old async CallInUIThread path scheduled the pump and
+    // then returned immediately, so the state read always saw the *previous*
+    // frame's input – causing missed presses that only landed after 5-10
+    // tries once the UI thread caught up.
+    bool is_queued = false;
+    sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+    attached_window_->app_context().CallInUIThreadSynchronous([this]() {
+      SDL_PumpEvents();
+      sdl_pumpevents_queued_ = false;
+    });
   }
 
   auto guard = DrainAndLock();
@@ -301,7 +312,15 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
   auto is_active = this->is_active();
 
   if (is_active) {
-    QueueControllerUpdate();
+    // Same synchronous pump as GetDeviceState: keystroke events are built
+    // from the diff between current and previous button state, so they must
+    // also read a state that was pumped this frame.
+    bool is_queued = false;
+    sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+    attached_window_->app_context().CallInUIThreadSynchronous([this]() {
+      SDL_PumpEvents();
+      sdl_pumpevents_queued_ = false;
+    });
   }
 
   auto guard = DrainAndLock();

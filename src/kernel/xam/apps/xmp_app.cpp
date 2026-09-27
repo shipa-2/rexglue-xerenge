@@ -131,6 +131,10 @@ int ResolveSongIndex(const XmpApp::Playlist* playlist, uint32_t song_handle) {
       return int(i);
     }
   }
+  // Fallback: in case song_handle is a 0-based track index
+  if (song_handle < playlist->songs.size()) {
+    return int(song_handle);
+  }
   return -1;
 }
 
@@ -172,7 +176,46 @@ XmpApp::XmpApp(KernelState* kernel_state)
   // hangs waiting for a thread that was never going to finish.
 }
 
+XmpApp::~XmpApp() {
+  worker_running_ = false;
+  resume_fence_.Signal();
+  if (worker_thread_) {
+    rex::thread::Wait(worker_thread_.get(), false, std::chrono::milliseconds(500));
+    worker_thread_.reset();
+  }
+  SetActiveDriver(nullptr);
+  if (host_driver_) {
+    auto* audio_system =
+        static_cast<rex::audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
+    if (audio_system) {
+      audio_system->DestroyHostDriver(host_driver_);
+    }
+    host_driver_ = nullptr;
+  }
+  if (frame_addr_) {
+    memory_->SystemHeapFree(frame_addr_);
+    frame_addr_ = 0;
+  }
+}
+
 void XmpApp::EnsureWorkerStarted() {
+  if (!driver_semaphore_) {
+    driver_semaphore_ = rex::thread::Semaphore::Create(12, 12);
+  }
+  if (!host_driver_) {
+    auto* audio_system =
+        static_cast<rex::audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
+    if (audio_system &&
+        XSUCCEEDED(audio_system->CreateHostDriver(driver_semaphore_.get(), &host_driver_)) &&
+        host_driver_) {
+      SetActiveDriver(host_driver_);
+    } else {
+      REXKRNL_ERROR("XMP: could not create host audio driver");
+    }
+  }
+  if (!frame_addr_) {
+    frame_addr_ = memory_->SystemHeapAlloc(kFrameBytes);
+  }
   if (worker_thread_ || !REXCVAR_GET(xmp_enable)) {
     return;
   }
@@ -233,6 +276,42 @@ void XmpApp::DiscardActiveDriverFrames() {
   }
 }
 
+XmpApp::Playlist* XmpApp::FindPlaylist(uint32_t handle) {
+  if (handle) {
+    auto it = playlists_.find(handle);
+    if (it != playlists_.end() && it->second) {
+      return it->second;
+    }
+    for (const auto& [k, p] : playlists_) {
+      if (p && (p->handle == handle || p->storage_ptr == handle)) {
+        return p;
+      }
+    }
+    if (handle >= 0x80000000u && handle <= 0x9FFFFFFFu) {
+      uint32_t deref = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(handle));
+      if (deref && deref != handle) {
+        auto it2 = playlists_.find(deref);
+        if (it2 != playlists_.end() && it2->second) {
+          return it2->second;
+        }
+        for (const auto& [k, p] : playlists_) {
+          if (p && (p->handle == deref || p->storage_ptr == deref)) {
+            return p;
+          }
+        }
+      }
+    }
+  }
+  // Title fallback: Burnout Revenge only ever maintains one title playlist (EA Trax)
+  if (active_playlist_) {
+    return active_playlist_;
+  }
+  if (!playlists_.empty()) {
+    return playlists_.begin()->second;
+  }
+  return nullptr;
+}
+
 void XmpApp::OnPlaybackControlChanged() {
   if (!IsTitleInPlaybackControl()) {
     DiscardActiveDriverFrames();
@@ -291,6 +370,8 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
     avio_context_free(&avio_ctx);
   };
 
+  format_ctx->max_analyze_duration = 500000;
+  format_ctx->probesize = 65536;
   if (avformat_find_stream_info(format_ctx.get(), nullptr) < 0) {
     REXKRNL_ERROR("XMP: no stream info in {}", utf8_path);
     format_ctx.reset();
@@ -335,20 +416,14 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
     return false;
   }
 
-  auto semaphore = rex::thread::Semaphore::Create(64, 64);
-  auto* audio_system =
-      static_cast<rex::audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
-  rex::audio::AudioDriver* driver = nullptr;
-  if (XFAILED(audio_system->CreateHostDriver(semaphore.get(), &driver)) || !driver) {
-    REXKRNL_ERROR("XMP: could not create an audio driver for {}", utf8_path);
+  EnsureWorkerStarted();
+  if (!host_driver_ || !driver_semaphore_ || !frame_addr_) {
+    REXKRNL_ERROR("XMP: audio driver not ready for {}", utf8_path);
     format_ctx.reset();
     free_avio();
     vfs_file->Destroy();
     return false;
   }
-  SetActiveDriver(driver);
-
-  uint32_t frame_addr = memory_->SystemHeapAlloc(kFrameBytes);
 
   std::unique_ptr<AVPacket, PacketDeleter> packet(av_packet_alloc());
   std::unique_ptr<AVFrame, FrameDeleter> frame(av_frame_alloc());
@@ -367,13 +442,13 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
     if (is_superseded()) {
       return false;
     }
-    rex::thread::Wait(semaphore.get(), true);
+    rex::thread::Wait(driver_semaphore_.get(), true);
     if (is_superseded()) {
       return false;
     }
-    WriteGuestAudioFrame(memory_->TranslateVirtual(frame_addr), stereo.data(),
+    WriteGuestAudioFrame(memory_->TranslateVirtual(frame_addr_), stereo.data(),
                          kFrameChannelSamples, volume_);
-    driver->SubmitFrame(frame_addr);
+    host_driver_->SubmitFrame(frame_addr_);
     stereo.erase(stereo.begin(), stereo.begin() + kFrameChannelSamples * 2);
     return true;
   };
@@ -449,9 +524,6 @@ done_reading:
     }
   }
 
-  memory_->SystemHeapFree(frame_addr);
-  SetActiveDriver(nullptr);
-  audio_system->DestroyHostDriver(driver);
   format_ctx.reset();
   free_avio();
   vfs_file->Destroy();
@@ -524,13 +596,14 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
                                          uint32_t playlist_name_ptr,
                                          const std::u16string& playlist_name, uint32_t flags,
                                          uint32_t out_song_handles, uint32_t out_playlist_handle) {
-  REXKRNL_DEBUG(
+  REXKRNL_INFO(
       "XMPCreateTitlePlaylist({:08X}, {:08X}, {:08X}({}), {:08X}, {:08X}, "
       "{:08X})",
       songs_ptr, song_count, playlist_name_ptr, rex::string::to_utf8(playlist_name), flags,
       out_song_handles, out_playlist_handle);
   auto playlist = std::make_unique<Playlist>();
   playlist->handle = ++next_playlist_handle_;
+  playlist->storage_ptr = out_playlist_handle;
   playlist->name = playlist_name;
   playlist->flags = flags;
   if (songs_ptr) {
@@ -571,38 +644,47 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
 
   auto global_lock = global_critical_region_.Acquire();
   playlists_.insert({playlist->handle, playlist.get()});
+  if (playlist->storage_ptr) {
+    playlists_.insert({playlist->storage_ptr, playlist.get()});
+  }
+  active_playlist_ = playlist.get();
   playlist.release();
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
-  REXKRNL_DEBUG("XMPDeleteTitlePlaylist({:08X})", playlist_handle);
+  REXKRNL_INFO("XMPDeleteTitlePlaylist({:08X})", playlist_handle);
   auto global_lock = global_critical_region_.Acquire();
-  auto it = playlists_.find(playlist_handle);
-  if (it == playlists_.end()) {
+  auto* playlist = FindPlaylist(playlist_handle);
+  if (!playlist) {
     REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
     return X_E_NOTFOUND;
   }
-  auto playlist = it->second;
   if (playlist == active_playlist_) {
     XMPStop(0);
+    active_playlist_ = nullptr;
   }
-  playlists_.erase(it);
+  for (auto it = playlists_.begin(); it != playlists_.end(); ) {
+    if (it->second == playlist) {
+      it = playlists_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   delete playlist;
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
-  REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
+  REXKRNL_INFO("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
   Playlist* playlist = nullptr;
   {
     auto global_lock = global_critical_region_.Acquire();
-    auto it = playlists_.find(playlist_handle);
-    if (it == playlists_.end()) {
+    playlist = FindPlaylist(playlist_handle);
+    if (!playlist) {
       REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
       return X_E_NOTFOUND;
     }
-    playlist = it->second;
   }
 
   // This call is not necessarily a one-shot "start the music" - Burnout
@@ -614,10 +696,11 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   // exactly like noise, not music. Only (re)start when this would actually
   // change something. Burnout Revenge also recreates the playlist handle while
   // previewing a track, so compare the file path rather than the pointer.
-  const int target_index = ResolveSongIndex(playlist, song_handle);
+  int target_index = ResolveSongIndex(playlist, song_handle);
   if (target_index < 0 || size_t(target_index) >= playlist->songs.size()) {
-    REXKRNL_ERROR("XMPPlayTitlePlaylist: song index {} out of range", target_index);
-    return X_E_INVALIDARG;
+    target_index = (active_song_index_ + 1) % playlist->songs.size();
+    REXKRNL_WARN("XMPPlayTitlePlaylist: song handle {:08X} not found, defaulting to [{}]",
+                 song_handle, target_index);
   }
   const auto target_path = rex::string::to_utf8(playlist->songs[target_index]->file_path);
   if (state_ == State::kPlaying && target_index == active_song_index_ &&
@@ -640,6 +723,7 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   active_song_handle_ = playlist->songs[target_index]->handle;
   active_file_path_.clear();
   state_ = State::kPlaying;
+  DiscardActiveDriverFrames();
   resume_fence_.Signal();
   OnStateChanged();
   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
@@ -660,7 +744,7 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_INFO("XMP: title stops playback");
   DiscardActiveDriverFrames();
-  active_playlist_ = nullptr;  // ?
+  // Keep active_playlist_ intact; only XMPDeleteTitlePlaylist frees it.
   active_song_index_ = 0;
   active_song_handle_ = 0;
   active_file_path_.clear();
@@ -681,38 +765,58 @@ X_HRESULT XmpApp::XMPPause() {
 }
 
 X_HRESULT XmpApp::XMPNext() {
-  REXKRNL_DEBUG("XMPNext()");
-  if (!active_playlist_ || active_playlist_->songs.empty()) {
+  REXKRNL_INFO("XMPNext()");
+  Playlist* playlist = nullptr;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    playlist = FindPlaylist(0);
+    if (playlist) {
+      active_playlist_ = playlist;
+    }
+  }
+  if (!playlist || playlist->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
-  if (!IsLastSongInPlaylist(active_playlist_, active_song_index_)) {
+  if (!IsLastSongInPlaylist(playlist, active_song_index_)) {
     active_song_index_ += 1;
   } else {
     active_song_index_ = 0;
   }
-  active_song_handle_ = active_playlist_->songs[active_song_index_]->handle;
+  active_song_handle_ = playlist->songs[active_song_index_]->handle;
   active_file_path_.clear();
+  DiscardActiveDriverFrames();
   resume_fence_.Signal();
   OnStateChanged();
+  kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPPrevious() {
-  REXKRNL_DEBUG("XMPPrevious()");
-  if (!active_playlist_ || active_playlist_->songs.empty()) {
+  REXKRNL_INFO("XMPPrevious()");
+  Playlist* playlist = nullptr;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    playlist = FindPlaylist(0);
+    if (playlist) {
+      active_playlist_ = playlist;
+    }
+  }
+  if (!playlist || playlist->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
   if (active_song_index_ <= 0) {
-    active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
+    active_song_index_ = static_cast<int>(playlist->songs.size()) - 1;
   } else {
     --active_song_index_;
   }
-  active_song_handle_ = active_playlist_->songs[active_song_index_]->handle;
+  active_song_handle_ = playlist->songs[active_song_index_]->handle;
   active_file_path_.clear();
+  DiscardActiveDriverFrames();
   resume_fence_.Signal();
   OnStateChanged();
+  kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
   return X_E_SUCCESS;
 }
 
@@ -734,12 +838,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     case 0x00070002: {
       assert_true(!buffer_length || buffer_length == 12);
       uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t storage_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t raw_playlist = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t song_handle = memory::load_and_swap<uint32_t>(buffer + 8);  // 0?
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
       assert_true(xmp_client == 0x00000002);
-      return XMPPlayTitlePlaylist(playlist_handle, song_handle);
+      return XMPPlayTitlePlaylist(raw_playlist, song_handle);
     }
     case 0x00070003: {
       assert_true(!buffer_length || buffer_length == 4);
@@ -852,9 +954,21 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
       assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
-      return XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
-                                    playlist_name, args->flags, args->song_handles_ptr,
-                                    args->storage_ptr);
+      auto status = XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
+                                           playlist_name, args->flags, args->song_handles_ptr,
+                                           args->storage_ptr);
+      if (status == X_E_SUCCESS && active_playlist_) {
+        auto global_lock = global_critical_region_.Acquire();
+        playlists_.insert({uint32_t(args->storage_ptr), active_playlist_});
+        if (args->playlist_handle_ptr) {
+          uint32_t handle_val =
+              memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->playlist_handle_ptr));
+          if (handle_val) {
+            playlists_.insert({handle_val, active_playlist_});
+          }
+        }
+      }
+      return status;
     }
     case 0x0007000E: {
       assert_true(!buffer_length || buffer_length == 12);
@@ -893,10 +1007,8 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 8);
 
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
-      return XMPDeleteTitlePlaylist(playlist_handle);
+      return XMPDeleteTitlePlaylist(args->storage_ptr);
     }
     case 0x0007001A: {
       // XMPSetPlaybackController
