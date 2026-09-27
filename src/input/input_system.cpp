@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -234,6 +235,16 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    if (state.gamepad.buttons != 0) {
+      // Once per device: which one a press came from, when nobody expects one.
+      static std::set<uint64_t> reported;
+      if (reported.size() < 16 && reported.insert(uint64_t(id)).second) {
+        const DeviceInfo* info = DeviceInfoFor(id);
+        REXLOG_INFO("input: first press from device {} '{}'{}: buttons {:04X}", uint64_t(id),
+                    info ? info->name : std::string("?"),
+                    info && info->synthetic ? " (synthetic)" : "", uint32_t(state.gamepad.buttons));
+      }
+    }
     if (!any) {
       merged = state;
       any = true;

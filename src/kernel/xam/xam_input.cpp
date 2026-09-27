@@ -341,14 +341,22 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     // fighting back - is what makes it useful for looking at anything past it.
     // Neutral means "not touching it", so the recording continues by itself.
     const auto& live = input_state->gamepad;
-    const bool live_active = live.buttons != 0 || live.left_trigger != 0 ||
-                             live.right_trigger != 0 || live.thumb_lx != 0 ||
-                             live.thumb_ly != 0 || live.thumb_rx != 0 || live.thumb_ry != 0;
+    // Inside the XInput dead zones a resting pad still drifts, and that drift
+    // alone used to end every replay at its first poll.
+    const auto outside = [](int32_t v, int32_t zone) { return v > zone || v < -zone; };
+    const bool live_active =
+        (live.buttons != 0 || live.left_trigger > 30 || live.right_trigger > 30 ||
+        outside(live.thumb_lx, 7849) || outside(live.thumb_ly, 7849) ||
+        outside(live.thumb_rx, 8689) || outside(live.thumb_ry, 8689));
     if (live_active) {
       static bool announced = false;
       if (!announced && ReplayPath()) {
         announced = true;
-        REXKRNL_INFO("pad replay: live input taking over");
+        REXKRNL_INFO("pad replay: live input taking over (buttons {:04X} triggers {} {} "
+                     "sticks {} {} {} {})",
+                     uint32_t(live.buttons), uint32_t(live.left_trigger),
+                     uint32_t(live.right_trigger), int32_t(live.thumb_lx),
+                     int32_t(live.thumb_ly), int32_t(live.thumb_rx), int32_t(live.thumb_ry));
       }
       StampReplayPacketNumber(&*input_state);
       // Record what the title saw, even mid-replay. Extending a recording by
