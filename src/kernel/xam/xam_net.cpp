@@ -41,9 +41,11 @@
 #include <winsock2.h>                    // NOLINT(build/include_order)
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 // --online: answer as a console signed in to Xbox Live with a working
@@ -53,6 +55,10 @@
 REXCVAR_DEFINE_BOOL(online, false, "Network",
                     "Pretend to be signed in to Xbox Live with a working connection (a stub for "
                     "reaching online menus; no real service is contacted)");
+REXCVAR_DEFINE_STRING(lobby_server, "127.0.0.1", "Network",
+                      "IP address or hostname of the EA Lobby directory server");
+REXCVAR_DEFINE_STRING(local_ip, "", "Network",
+                      "Override local IPv4 address advertised to peers and lobby");
 
 namespace rex {
 namespace kernel {
@@ -155,6 +161,14 @@ typedef struct {
   rex::be<uint32_t> cina;
   in_addr aina[8];
 } XNDNS;
+
+typedef struct {
+  uint8_t ab[8];
+} XNKID;
+
+typedef struct {
+  uint8_t ab[16];
+} XNKEY;
 
 typedef struct {
   uint8_t flags;
@@ -515,15 +529,56 @@ struct XnAddrStatus {
   static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
 };
 
+static uint32_t GetLocalIpAddress() {
+  std::string override_ip = REXCVAR_GET(local_ip);
+  if (!override_ip.empty()) {
+    in_addr addr{};
+    if (inet_pton(AF_INET, override_ip.c_str(), &addr) == 1) {
+      return addr.s_addr;
+    }
+  }
+
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+  int probe_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (probe_fd >= 0) {
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(53);
+    std::string lobby_addr = REXCVAR_GET(lobby_server);
+    if (inet_pton(AF_INET, lobby_addr.c_str(), &dest.sin_addr) != 1) {
+      dest.sin_addr.s_addr = inet_addr("8.8.8.8");
+    }
+    if (connect(probe_fd, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest)) == 0) {
+      sockaddr_in local{};
+      socklen_t len = sizeof(local);
+      if (getsockname(probe_fd, reinterpret_cast<sockaddr*>(&local), &len) == 0 &&
+          local.sin_addr.s_addr != 0 && local.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        close(probe_fd);
+        return local.sin_addr.s_addr;
+      }
+    }
+    close(probe_fd);
+  }
+#endif
+
+  return htonl(INADDR_LOOPBACK);
+}
+
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   if (OnlineStub()) {
     // A console with a static address behind a gateway, DNS configured and
     // online. EA's DirtySock reads GATEWAY/DNS as "+isp" - an internet
     // connection - and anything less as a problem to report.
-    addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
-    addr_ptr->inaOnline.s_addr = htonl(INADDR_LOOPBACK);
+    const uint32_t local_ip_net = GetLocalIpAddress();
+    addr_ptr->ina.s_addr = local_ip_net;
+    addr_ptr->inaOnline.s_addr = local_ip_net;
     addr_ptr->wPortOnline = 3074;
     std::memset(addr_ptr->abEnet, 0xCC, 6);
+    const uint32_t ip_host = ntohl(local_ip_net);
+    addr_ptr->abEnet[2] = uint8_t((ip_host >> 24) & 0xFF);
+    addr_ptr->abEnet[3] = uint8_t((ip_host >> 16) & 0xFF);
+    addr_ptr->abEnet[4] = uint8_t((ip_host >> 8) & 0xFF);
+    addr_ptr->abEnet[5] = uint8_t(ip_host & 0xFF);
     for (uint8_t i = 0; i < 20; ++i) {
       addr_ptr->abOnline[i] = uint8_t(0x5A + i);
     }
@@ -568,17 +623,32 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
-  rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
+  if (!string_out || string_size == 0) {
+    return;
+  }
+  const uint8_t b1 = uint8_t((in_addr >> 24) & 0xFF);
+  const uint8_t b2 = uint8_t((in_addr >> 16) & 0xFF);
+  const uint8_t b3 = uint8_t((in_addr >> 8) & 0xFF);
+  const uint8_t b4 = uint8_t(in_addr & 0xFF);
+
+  char buf[32] = {};
+  std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", b1, b2, b3, b4);
+  rex::string::copy_truncating(string_out, buf, string_size);
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  if (OnlineStub() && in_addr) {
-    // Every peer is this machine.
-    const uint32_t loopback = htonl(INADDR_LOOPBACK);
-    std::memcpy(in_addr, &loopback, sizeof(loopback));
+  if (OnlineStub() && in_addr && xn_addr) {
+    uint32_t peer_ip = xn_addr->inaOnline.s_addr;
+    if (!peer_ip) {
+      peer_ip = xn_addr->ina.s_addr;
+    }
+    if (!peer_ip) {
+      peer_ip = htonl(INADDR_LOOPBACK);
+    }
+    std::memcpy(in_addr, &peer_ip, sizeof(peer_ip));
     return 0;
   }
   return 1;
@@ -588,7 +658,43 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
 // FIXME: Arguments may not be correct.
 u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
+  if (OnlineStub() && in_addr && xn_addr) {
+    uint32_t ip = 0;
+    std::memcpy(&ip, in_addr, sizeof(ip));
+    xn_addr.Zero();
+    xn_addr->ina.s_addr = ip;
+    xn_addr->inaOnline.s_addr = ip;
+    xn_addr->wPortOnline = 3074;
+    return 0;
+  }
   return 1;
+}
+
+u32 NetDll_XNetCreateKey_entry(u32 caller, ppc_ptr_t<XNKID> pxnkid, ppc_ptr_t<XNKEY> pxnkey) {
+  if (pxnkid) {
+    for (int i = 0; i < 8; ++i) {
+      pxnkid->ab[i] = uint8_t(std::rand() & 0xFF);
+    }
+    pxnkid->ab[0] |= 0x01;
+  }
+  if (pxnkey) {
+    for (int i = 0; i < 16; ++i) {
+      pxnkey->ab[i] = uint8_t(std::rand() & 0xFF);
+    }
+  }
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, ppc_ptr_t<XNKID> pxnkid, ppc_ptr_t<XNKEY> pxnkey) {
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, ppc_ptr_t<XNKID> pxnkid) {
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, mapped_void in_addr) {
+  return 0;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
@@ -627,15 +733,58 @@ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+  std::string hostname = host ? std::string(host.host_address()) : std::string();
   if (OnlineStub()) {
-    REXKRNL_INFO("--online wire: DNS lookup of '{}' (answered: not found)",
-                 host ? std::string(host.host_address()) : std::string("?"));
+    REXKRNL_INFO("--online wire: DNS lookup of '{}'", hostname);
   }
-  // TODO(gibbed): actually implement this
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
     auto dns = REX_KERNEL_MEMORY()->TranslateVirtual<XNDNS*>(dns_guest);
-    dns->status = 1;  // non-zero = error
+    dns->status = 1;
+    dns->cina = 0;
+
+    if (OnlineStub()) {
+      in_addr addr{};
+      bool resolved = false;
+
+      // 1. Literal IP address
+      if (!hostname.empty() && inet_pton(AF_INET, hostname.c_str(), &addr) == 1) {
+        resolved = true;
+      }
+      // 2. EA Lobby / server domains (e.g. xblburnout06.ea.com) -> redirect to lobby_server
+      else if (hostname.find("ea.com") != std::string::npos || hostname.empty()) {
+        std::string target = REXCVAR_GET(lobby_server);
+        if (inet_pton(AF_INET, target.c_str(), &addr) == 1) {
+          resolved = true;
+        } else {
+          struct hostent* he = gethostbyname(target.c_str());
+          if (he && he->h_addr_list && he->h_addr_list[0]) {
+            std::memcpy(&addr, he->h_addr_list[0], sizeof(in_addr));
+            resolved = true;
+          }
+        }
+      }
+      // 3. System DNS fallback
+      else {
+        struct hostent* he = gethostbyname(hostname.c_str());
+        if (he && he->h_addr_list && he->h_addr_list[0]) {
+          std::memcpy(&addr, he->h_addr_list[0], sizeof(in_addr));
+          resolved = true;
+        }
+      }
+
+      if (resolved) {
+        dns->status = 0;
+        dns->cina = 1;
+        dns->aina[0] = addr;
+        char ip_str[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        REXKRNL_INFO("--online wire: DNS lookup of '{}' resolved to {}", hostname, ip_str);
+      } else {
+        REXKRNL_WARN("--online wire: DNS lookup of '{}' failed", hostname);
+      }
+    }
+
     *pdns = dns_guest;
   }
   if (event_handle) {
@@ -1183,6 +1332,10 @@ REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr, rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
 
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
@@ -1228,7 +1381,6 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
@@ -1237,14 +1389,11 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);

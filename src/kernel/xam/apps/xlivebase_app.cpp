@@ -13,6 +13,7 @@
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
+#include <cstring>
 
 namespace rex {
 namespace kernel {
@@ -89,6 +90,36 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
     }
     case 0x00058037: {
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
+    case 0x00050079: {
+      // EA DirtySock ProtoLobby auth token query. Called when the title begins
+      // connecting to the EA lobby server (state 5→6 transition). DirtySock
+      // uses this to retrieve Xbox Live auth credentials for the lobby login.
+      // buffer_ptr = output struct (0x28 = 40 bytes), buffer_length = 0x28.
+      // Returning X_E_FAIL causes DirtySock to block indefinitely in "busy"
+      // state. Returning X_E_SUCCESS with zeroed buffer makes DirtySock
+      // proceed to send the `auth` packet using a blank/null token, which is
+      // fine for our stub ealobby server.
+      REXKRNL_DEBUG("XLiveBaseEADirtySockAuthToken({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (buffer_ptr && buffer_length) {
+        auto* buf = memory_->TranslateVirtual(buffer_ptr);
+        std::memset(buf, 0, buffer_length);
+      }
+      return X_E_SUCCESS;
+    }
+    case 0x00050074: {
+      // Related EA/DirtySock pre-auth call, seen alongside 0x00050079.
+      REXKRNL_DEBUG("XLiveBaseEAPreAuth({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (buffer_ptr && buffer_length) {
+        auto* buf = memory_->TranslateVirtual(buffer_ptr);
+        std::memset(buf, 0, buffer_length);
+      }
+      return X_E_SUCCESS;
+    }
+    case 0x00050080: {
+      // EA logon service check (seen in other EA titles during lobby init).
+      REXKRNL_DEBUG("XLiveBaseEALogonCheck({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
   }

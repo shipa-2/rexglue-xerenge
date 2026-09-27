@@ -198,7 +198,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   if (from) {
     from->sin_family = nfrom.sin_family;
     from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    from->sin_port = ntohs(nfrom.sin_port);         // BE <- BE
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -215,22 +215,10 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
                     uint32_t to_len) {
-  // Send 2 copies of the packet: One to XNet (for network security) and an
-  // unencrypted copy for other Xenia hosts.
-  // TODO(DrChat): Enable when I commit XNet.
-  /*
-  auto xam = kernel_state()->GetKernelModule<xam::XamModule>("xam.xex");
-  auto xnet = xam->xnet();
-  if (xnet) {
-    xnet->SendPacket(this, to, buf, buf_len);
-  }
-  */
-
-  sockaddr_in nto;
+  sockaddr_in nto{};
   if (to) {
-    nto.sin_addr.s_addr = to->sin_addr;
+    std::memcpy(&nto, to, sizeof(nto));
     nto.sin_family = to->sin_family;
-    nto.sin_port = to->sin_port;
   }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
