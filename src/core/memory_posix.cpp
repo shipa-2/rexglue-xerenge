@@ -13,6 +13,10 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <fstream>
 #include <functional>
 #include <string>
@@ -150,6 +154,126 @@ bool IsWritableExecutableMemorySupported() {
 #if REX_PLATFORM_LINUX
 namespace {
 
+// What this process mapped, and with what access, as it set it. Linux has no
+// call to ask the protection of a page: the only source is /proc/self/maps,
+// which the kernel writes out whole on every read. With the guest's write
+// watches splitting memory into thousands of areas that read cost milliseconds,
+// and the write-fault handler did it under the global memory lock on every
+// fault - half a second of frozen screen on each scene change. Only answers
+// for ranges it saw being set; anything else still goes to /proc/self/maps.
+class ProtectionCache {
+ public:
+  void Set(uintptr_t begin, uintptr_t end, PageAccess access) {
+    if (begin >= end) {
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    Erase(begin, end);
+    ranges_[begin] = {end, access};
+    Coalesce(begin);
+  }
+  void Forget(uintptr_t begin, uintptr_t end) {
+    if (begin >= end) {
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    Erase(begin, end);
+  }
+  bool Find(uintptr_t address, uintptr_t& end, PageAccess& access) {
+    std::lock_guard lock(mutex_);
+    auto it = ranges_.upper_bound(address);
+    if (it == ranges_.begin()) {
+      return false;
+    }
+    --it;
+    if (address >= it->second.end) {
+      return false;
+    }
+    end = it->second.end;
+    access = it->second.access;
+    return true;
+  }
+  bool Covers(uintptr_t begin, uintptr_t end) {
+    std::lock_guard lock(mutex_);
+    uintptr_t cursor = begin;
+    auto it = ranges_.upper_bound(begin);
+    if (it != ranges_.begin()) {
+      --it;
+    }
+    for (; it != ranges_.end() && cursor < end; ++it) {
+      if (it->first > cursor) {
+        return false;
+      }
+      cursor = std::max(cursor, it->second.end);
+    }
+    return cursor >= end;
+  }
+
+ private:
+  struct Range {
+    uintptr_t end;
+    PageAccess access;
+  };
+  // Cuts [begin, end) out of whatever overlaps it.
+  void Erase(uintptr_t begin, uintptr_t end) {
+    auto it = ranges_.upper_bound(begin);
+    if (it != ranges_.begin()) {
+      auto previous = std::prev(it);
+      if (previous->first < begin && previous->second.end > begin) {
+        const Range whole = previous->second;
+        previous->second.end = begin;
+        if (whole.end > end) {
+          ranges_[end] = whole;
+        }
+      }
+    }
+    it = ranges_.lower_bound(begin);
+    while (it != ranges_.end() && it->first < end) {
+      if (it->second.end > end) {
+        const Range rest = it->second;
+        ranges_.erase(it);
+        ranges_[end] = rest;
+        break;
+      }
+      it = ranges_.erase(it);
+    }
+  }
+  void Coalesce(uintptr_t begin) {
+    auto it = ranges_.find(begin);
+    if (it == ranges_.end()) {
+      return;
+    }
+    auto next = std::next(it);
+    if (next != ranges_.end() && next->first == it->second.end &&
+        next->second.access == it->second.access) {
+      it->second.end = next->second.end;
+      ranges_.erase(next);
+    }
+    if (it != ranges_.begin()) {
+      auto previous = std::prev(it);
+      if (previous->second.end == it->first && previous->second.access == it->second.access) {
+        previous->second.end = it->second.end;
+        ranges_.erase(it);
+      }
+    }
+  }
+  std::mutex mutex_;
+  std::map<uintptr_t, Range> ranges_;
+};
+
+ProtectionCache& Protections() {
+  static ProtectionCache cache;
+  return cache;
+}
+
+uintptr_t PageFloor(const void* address) {
+  return reinterpret_cast<uintptr_t>(address) & ~(uintptr_t(page_size()) - 1);
+}
+uintptr_t PageCeil(const void* address, size_t length) {
+  const uintptr_t mask = uintptr_t(page_size()) - 1;
+  return (reinterpret_cast<uintptr_t>(address) + length + mask) & ~mask;
+}
+
 struct LinuxMapEntry {
   uintptr_t start = 0;
   uintptr_t end = 0;
@@ -198,6 +322,9 @@ static bool IsRangeFullyMapped(void* base_address, size_t length) {
   const uintptr_t end = begin + length;
   if (end < begin) {  // overflow check
     return false;
+  }
+  if (Protections().Covers(begin, end)) {
+    return true;
   }
 
   std::ifstream maps("/proc/self/maps");
@@ -296,6 +423,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
+#if REX_PLATFORM_LINUX
+    Protections().Set(PageFloor(result), PageCeil(result, length),
+                      prot_initial == PROT_NONE ? PageAccess::kNoAccess : access);
+#endif
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
@@ -307,6 +438,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     // Verify the entire range is mapped before using mprotect
     if (IsRangeFullyMapped(base_address, length)) {
       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+        Protections().Set(PageFloor(base_address), PageCeil(base_address, length), access);
         return base_address;
       }
     }
@@ -323,13 +455,23 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
+#if REX_PLATFORM_LINUX
+      Protections().Set(PageFloor(base_address), PageCeil(base_address, length),
+                        PageAccess::kNoAccess);
+#endif
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      if (munmap(base_address, length) != 0) {
+        return false;
+      }
+#if REX_PLATFORM_LINUX
+      Protections().Forget(PageFloor(base_address), PageCeil(base_address, length));
+#endif
+      return true;
     }
     default:
       // how we get here? :(
@@ -357,9 +499,15 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   //             atomic in a mutli-threaded process either, but it's something to be aware of.
   // Query old access before changing, if the caller needs it
   if (out_old_access) {
-    LinuxMapEntry e;
-    if (FindEntryForAddress(base_address, e)) {
-      *out_old_access = PermsToPageAccess(e.perms);
+    uintptr_t known_end = 0;
+    PageAccess known = PageAccess::kNoAccess;
+    if (Protections().Find(reinterpret_cast<uintptr_t>(base_address), known_end, known)) {
+      *out_old_access = known;
+    } else {
+      LinuxMapEntry e;
+      if (FindEntryForAddress(base_address, e)) {
+        *out_old_access = PermsToPageAccess(e.perms);
+      }
     }
   }
 #endif
@@ -370,6 +518,11 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
                  strerror(errno), errno);
   }
+#if REX_PLATFORM_LINUX
+  if (ret == 0) {
+    Protections().Set(PageFloor(base_address), PageCeil(base_address, length), access);
+  }
+#endif
   return ret == 0;
 }
 
@@ -415,6 +568,17 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #else
   access_out = PageAccess::kNoAccess;
   length = 0;
+
+  {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
+    uintptr_t known_end = 0;
+    PageAccess known = PageAccess::kNoAccess;
+    if (Protections().Find(addr, known_end, known)) {
+      length = static_cast<size_t>(known_end - addr);
+      access_out = known;
+      return true;
+    }
+  }
 
   LinuxMapEntry e;
   if (!FindEntryForAddress(base_address, e)) {
@@ -531,11 +695,35 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
     return nullptr;
   }
 
+  NoteMapping(result, length, access);
   return result;
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
-  return munmap(base_address, length) == 0;
+  if (munmap(base_address, length) != 0) {
+    return false;
+  }
+  ForgetMapping(base_address, length);
+  return true;
+}
+
+void NoteMapping(void* base_address, size_t length, PageAccess access) {
+#if REX_PLATFORM_LINUX
+  Protections().Set(PageFloor(base_address), PageCeil(base_address, length), access);
+#else
+  (void)base_address;
+  (void)length;
+  (void)access;
+#endif
+}
+
+void ForgetMapping(void* base_address, size_t length) {
+#if REX_PLATFORM_LINUX
+  Protections().Forget(PageFloor(base_address), PageCeil(base_address, length));
+#else
+  (void)base_address;
+  (void)length;
+#endif
 }
 
 }  // namespace memory

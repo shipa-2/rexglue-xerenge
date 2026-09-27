@@ -114,6 +114,12 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+// For memory mapped directly with mmap rather than through AllocFixed or
+// MapFileView: tells QueryProtect what is there, so it need not read
+// /proc/self/maps. No-ops where the platform can query protection cheaply.
+void NoteMapping(void* base_address, size_t length, PageAccess access);
+void ForgetMapping(void* base_address, size_t length);
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>
