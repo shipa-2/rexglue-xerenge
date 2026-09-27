@@ -998,6 +998,18 @@ uint32_t XThread::SelfSuspend() {
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
+  struct DelayNote {
+    bool on;
+    std::chrono::steady_clock::time_point start;
+    ~DelayNote() {
+      if (on) {
+        NoteMainThreadWait(0, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - start)
+                                           .count()),
+                           true);
+      }
+    }
+  } note{MainThreadWaitNotesEnabled() && main_thread_, std::chrono::steady_clock::now()};
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {

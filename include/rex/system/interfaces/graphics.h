@@ -150,6 +150,9 @@ class IGraphicsSystem {
   // The title called Swap: everything it issued before this belongs to the
   // frame being presented, anything after it to the next one.
   virtual void NoteGuestFrameEnd() {}
+  // True once after a debugger capture was written: the title side then logs
+  // the next frame's Direct3D calls to go with it.
+  virtual bool TakeCallTraceRequest() { return false; }
 
   // A draw the title issued through Direct3D. A backend that reads the command
   // ring sees these as packets and can ignore this; one that does not - or one

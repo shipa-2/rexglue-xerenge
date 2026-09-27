@@ -289,6 +289,11 @@ struct X_KTHREAD {
 };
 static_assert_size(X_KTHREAD, 0xAB0);
 
+// XERENGE_LONG_WAIT_MS: the title's main thread's time asleep, per second -
+// waits on objects (object = its guest address) and plain delays (sleep).
+void NoteMainThreadWait(uint32_t object, uint64_t microseconds, bool sleep);
+bool MainThreadWaitNotesEnabled();
+
 class XThread : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Thread;

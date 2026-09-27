@@ -11,7 +11,14 @@
 
 #include <vector>
 
+#include <chrono>
+#include <cstdlib>
+#include <algorithm>
+#include <map>
+#include <mutex>
+
 #include <rex/chrono/clock.h>
+#include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -200,8 +207,114 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   }
 }
 
+namespace {
+// XERENGE_LONG_WAIT_MS=N: every wait of the title's main thread that lasts N ms
+// or more, with the object and when it ended. A frozen screen during a scene
+// change is the main thread asleep, which a CPU profile cannot show.
+uint32_t LongWaitThresholdMs() {
+  static const uint32_t ms = [] {
+    const char* text = std::getenv("XERENGE_LONG_WAIT_MS");
+    return text ? uint32_t(std::strtoul(text, nullptr, 10)) : 0u;
+  }();
+  return ms;
+}
+
+class LongWaitProbe {
+ public:
+  LongWaitProbe(const char* kind, XObject* const* objects, uint32_t count)
+      : kind_(kind), objects_(objects), count_(count) {
+    if (LongWaitThresholdMs() == 0) {
+      return;
+    }
+    XThread* thread = XThread::GetCurrentThread();
+    active_ = thread != nullptr && thread->main_thread();
+    if (active_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+  ~LongWaitProbe() {
+    if (!active_) {
+      return;
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start_)
+                        .count();
+    NoteMainThreadWait(count_ ? objects_[0]->guest_object() : 0u, uint64_t(us), false);
+    const int64_t ms = us / 1000;
+    if (ms < int64_t(LongWaitThresholdMs())) {
+      return;
+    }
+    std::string what;
+    for (uint32_t i = 0; i < count_ && i < 4; ++i) {
+      what += fmt::format(" {:08X}/type{}", objects_[i]->guest_object(),
+                          uint32_t(objects_[i]->type()));
+    }
+    REXKRNL_WARN("long wait: main thread {} {} ms on{}{}", kind_, ms, what,
+                 count_ > 4 ? " ..." : "");
+  }
+
+ private:
+  const char* kind_;
+  XObject* const* objects_;
+  uint32_t count_;
+  bool active_ = false;
+  std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
+
+bool MainThreadWaitNotesEnabled() {
+  return LongWaitThresholdMs() != 0;
+}
+
+void NoteMainThreadWait(uint32_t object, uint64_t microseconds, bool sleep) {
+  struct Second {
+    std::chrono::steady_clock::time_point started;
+    uint64_t wait_us = 0, sleep_us = 0;
+    uint32_t waits = 0, sleeps = 0;
+    std::map<uint32_t, uint64_t> by_object;
+  };
+  static std::mutex mutex;
+  static Second second;
+  std::lock_guard lock(mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (second.started.time_since_epoch().count() == 0) {
+    second.started = now;
+  }
+  if (sleep) {
+    second.sleep_us += microseconds;
+    ++second.sleeps;
+  } else {
+    second.wait_us += microseconds;
+    ++second.waits;
+    second.by_object[object] += microseconds;
+  }
+  if (now - second.started < std::chrono::seconds(1)) {
+    return;
+  }
+  if (second.wait_us + second.sleep_us >= 100000) {
+    std::vector<std::pair<uint64_t, uint32_t>> top;
+    for (const auto& [obj, us] : second.by_object) {
+      top.emplace_back(us, obj);
+    }
+    std::sort(top.rbegin(), top.rend());
+    std::string objects;
+    for (size_t i = 0; i < top.size() && i < 3; ++i) {
+      objects += fmt::format(" {:08X}={}ms", top[i].second, top[i].first / 1000);
+    }
+    REXKRNL_WARN("main thread asleep: {} ms in {} waits,{} {} ms in {} delays (over {} ms)",
+                 second.wait_us / 1000, second.waits, objects, second.sleep_us / 1000,
+                 second.sleeps,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(now - second.started)
+                     .count());
+  }
+  second = Second{};
+  second.started = now;
+}
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  XObject* self = this;
+  LongWaitProbe probe("wait", &self, 1);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -262,6 +375,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
 X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  LongWaitProbe probe(wait_type ? "wait-any" : "wait-all", objects, count);
   std::vector<rex::thread::WaitHandle*> wait_handles(count);
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
