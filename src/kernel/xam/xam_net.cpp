@@ -51,6 +51,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -124,6 +126,48 @@ uint32_t OnlineLocalAddress() {
       }
       REXKRNL_WARN("--online: online_address '{}' is not an IPv4 address", configured);
     }
+#if !REX_PLATFORM_WIN32
+    // The LAN address of a physical interface (wired or wireless): not the
+    // default route's, which on a machine with a VPN or a proxy's TUN device
+    // is that device, unreachable from the next machine on the LAN.
+    {
+      ifaddrs* interfaces = nullptr;
+      uint32_t best = 0;
+      int best_rank = 0;
+      if (getifaddrs(&interfaces) == 0) {
+        for (ifaddrs* i = interfaces; i; i = i->ifa_next) {
+          if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) ||
+              (i->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT))) {
+            continue;
+          }
+          const std::string name = i->ifa_name ? i->ifa_name : "";
+          const auto starts = [&](const char* prefix) { return name.rfind(prefix, 0) == 0; };
+          if (starts("docker") || starts("br-") || starts("veth") || starts("virbr") ||
+              starts("tun") || starts("tap") || starts("wg") || starts("tailscale") ||
+              starts("zt") || starts("singbox") || starts("vmnet") || starts("vboxnet")) {
+            continue;
+          }
+          const uint32_t address = reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr.s_addr;
+          const uint32_t host = ntohl(address);
+          const bool private_range = (host >> 24) == 10 || (host >> 20) == 0xAC1 ||
+                                     (host >> 16) == 0xC0A8;
+          const bool physical = starts("en") || starts("eth") || starts("wl");
+          const int rank = (private_range ? 2 : 0) + (physical ? 1 : 0) + 1;
+          if (rank > best_rank) {
+            best_rank = rank;
+            best = address;
+          }
+        }
+        freeifaddrs(interfaces);
+      }
+      if (best) {
+        char text[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &best, text, sizeof(text));
+        REXKRNL_INFO("--online: this console's address is {}", text);
+        return best;
+      }
+    }
+#endif
     // The interface a packet to the outside would leave by. A UDP "connect"
     // only picks the route; nothing is sent.
 #if REX_PLATFORM_WIN32
