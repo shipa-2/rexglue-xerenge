@@ -85,12 +85,14 @@ class XmpApp : public system::xam::App {
   };
   struct Playlist {
     uint32_t handle;
+    uint32_t storage_ptr = 0;
     std::u16string name;
     uint32_t flags;
     std::vector<std::unique_ptr<Song>> songs;
   };
 
   explicit XmpApp(system::KernelState* kernel_state);
+  ~XmpApp() override;
 
   X_HRESULT XMPGetStatus(uint32_t status_ptr);
 
@@ -135,6 +137,7 @@ class XmpApp : public system::xam::App {
   void OnPlaybackControlChanged();
   void DiscardActiveDriverFrames();
   void SetActiveDriver(rex::audio::AudioDriver* driver);
+  Playlist* FindPlaylist(uint32_t handle);
 
   State state_;
   // The state last announced to the title (kMsgStateChanged); only a change
@@ -172,6 +175,9 @@ class XmpApp : public system::xam::App {
   // locals.
   std::mutex active_driver_mutex_;
   rex::audio::AudioDriver* active_driver_ = nullptr;
+  std::unique_ptr<rex::thread::Semaphore> driver_semaphore_;
+  rex::audio::AudioDriver* host_driver_ = nullptr;
+  uint32_t frame_addr_ = 0;
 };
 
 }  // namespace apps

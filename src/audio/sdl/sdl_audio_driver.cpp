@@ -110,15 +110,20 @@ bool SDLAudioDriver::Initialize() {
 }
 
 void SDLAudioDriver::DiscardPendingFrames() {
-  std::unique_lock<std::mutex> guard(frames_mutex_);
-  while (!frames_queued_.empty()) {
-    auto buffer = frames_queued_.front();
-    frames_queued_.pop();
-    frames_unused_.push(buffer);
-    if (semaphore_) {
-      auto ret = semaphore_->Release(1, nullptr);
-      assert_true(ret);
+  {
+    std::unique_lock<std::mutex> guard(frames_mutex_);
+    while (!frames_queued_.empty()) {
+      auto buffer = frames_queued_.front();
+      frames_queued_.pop();
+      frames_unused_.push(buffer);
+      if (semaphore_) {
+        auto ret = semaphore_->Release(1, nullptr);
+        assert_true(ret);
+      }
     }
+  }
+  if (sdl_stream_) {
+    SDL_ClearAudioStream(sdl_stream_);
   }
 }
 
