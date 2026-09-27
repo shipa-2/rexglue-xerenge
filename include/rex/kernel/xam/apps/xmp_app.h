@@ -157,6 +157,11 @@ class XmpApp : public system::xam::App {
 
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;
+  // The title's handle is the address of the storage it gave XMPCreateTitlePlaylist;
+  // our handle is only written into that storage, and the title's memory there
+  // does not stay intact (Burnout's race start left 0x164 in it). Look up by address.
+  std::unordered_map<uint32_t, uint32_t> storage_handles_;
+  uint32_t PlaylistHandleFromStorage(uint32_t storage_ptr);
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
 

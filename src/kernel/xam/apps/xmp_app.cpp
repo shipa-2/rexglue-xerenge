@@ -575,6 +575,23 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
   return X_E_SUCCESS;
 }
 
+uint32_t XmpApp::PlaylistHandleFromStorage(uint32_t storage_ptr) {
+  const uint32_t in_memory =
+      memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = storage_handles_.find(storage_ptr);
+  if (it == storage_handles_.end()) {
+    REXKRNL_ERROR("XMP: no playlist was created with storage {:08X} (it holds {:08X})",
+                  storage_ptr, in_memory);
+    return in_memory;
+  }
+  if (in_memory != it->second) {
+    REXKRNL_WARN("XMP: playlist storage {:08X} now holds {:08X}, not its handle {:08X}",
+                 storage_ptr, in_memory, it->second);
+  }
+  return it->second;
+}
+
 X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
   REXKRNL_DEBUG("XMPDeleteTitlePlaylist({:08X})", playlist_handle);
   auto global_lock = global_critical_region_.Acquire();
@@ -736,8 +753,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
       uint32_t storage_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
       uint32_t song_handle = memory::load_and_swap<uint32_t>(buffer + 8);  // 0?
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
+      const uint32_t playlist_handle = PlaylistHandleFromStorage(storage_ptr);
       assert_true(xmp_client == 0x00000002);
       return XMPPlayTitlePlaylist(playlist_handle, song_handle);
     }
@@ -852,9 +868,14 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
       assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
-      return XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
-                                    playlist_name, args->flags, args->song_handles_ptr,
-                                    args->storage_ptr);
+      const X_HRESULT result = XMPCreateTitlePlaylist(
+          args->songs_ptr, args->song_count, args->playlist_name_ptr, playlist_name, args->flags,
+          args->song_handles_ptr, args->storage_ptr);
+      if (result == X_E_SUCCESS) {
+        auto global_lock = global_critical_region_.Acquire();
+        storage_handles_[args->storage_ptr] = next_playlist_handle_;
+      }
+      return result;
     }
     case 0x0007000E: {
       assert_true(!buffer_length || buffer_length == 12);
@@ -893,10 +914,14 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 8);
 
-      uint32_t playlist_handle =
-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
+      const uint32_t playlist_handle = PlaylistHandleFromStorage(args->storage_ptr);
       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
-      return XMPDeleteTitlePlaylist(playlist_handle);
+      const X_HRESULT result = XMPDeleteTitlePlaylist(playlist_handle);
+      if (result == X_E_SUCCESS) {
+        auto global_lock = global_critical_region_.Acquire();
+        storage_handles_.erase(args->storage_ptr);
+      }
+      return result;
     }
     case 0x0007001A: {
       // XMPSetPlaybackController
