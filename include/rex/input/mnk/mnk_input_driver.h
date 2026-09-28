@@ -101,6 +101,9 @@ class MnkInputDriver final : public InputDriver,
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
+  // The buttons (and, in bits 16 and 17, the triggers) at the last poll: their
+  // changes become the keystrokes above.
+  uint32_t keystroke_buttons_ = 0;
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;

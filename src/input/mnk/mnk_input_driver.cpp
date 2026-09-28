@@ -354,6 +354,33 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   packet_number_++;
 
+  // The keystrokes (XInputGetKeystroke): each change of a button since the
+  // last poll, as a pad would report it. Nothing queued them before, and a
+  // screen that waits for a keystroke rather than reading the state - the
+  // Burnout Clips prompt after a race - never saw the keyboard at all.
+  {
+    static constexpr rex::ui::VirtualKey kButtonKeys[18] = {
+        rex::ui::VirtualKey::kXInputPadDpadUp,     rex::ui::VirtualKey::kXInputPadDpadDown,
+        rex::ui::VirtualKey::kXInputPadDpadLeft,   rex::ui::VirtualKey::kXInputPadDpadRight,
+        rex::ui::VirtualKey::kXInputPadStart,      rex::ui::VirtualKey::kXInputPadBack,
+        rex::ui::VirtualKey::kXInputPadLThumbPress, rex::ui::VirtualKey::kXInputPadRThumbPress,
+        rex::ui::VirtualKey::kXInputPadLShoulder,  rex::ui::VirtualKey::kXInputPadRShoulder,
+        rex::ui::VirtualKey::kNone,                rex::ui::VirtualKey::kNone,
+        rex::ui::VirtualKey::kXInputPadA,          rex::ui::VirtualKey::kXInputPadB,
+        rex::ui::VirtualKey::kXInputPadX,          rex::ui::VirtualKey::kXInputPadY,
+        rex::ui::VirtualKey::kXInputPadLTrigger,   rex::ui::VirtualKey::kXInputPadRTrigger,
+    };
+    const uint32_t now = uint32_t(buttons) | (lt ? 1u << 16 : 0u) | (rt ? 1u << 17 : 0u);
+    const uint32_t changed = now ^ keystroke_buttons_;
+    for (uint32_t bit = 0; bit < 18; ++bit) {
+      if ((changed & (1u << bit)) != 0 && kButtonKeys[bit] != rex::ui::VirtualKey::kNone &&
+          keystroke_queue_.size() < 64) {
+        EnqueueKeystroke(static_cast<uint16_t>(kButtonKeys[bit]), (now & (1u << bit)) != 0);
+      }
+    }
+    keystroke_buttons_ = now;
+  }
+
   if (out_state) {
     out_state->packet_number = packet_number_;
     out_state->gamepad.buttons = buttons;
@@ -379,6 +406,8 @@ X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
   if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  // A poll, so a screen that only asks for keystrokes still gets them.
+  GetDeviceState(id, nullptr);
   std::lock_guard lock(state_mutex_);
   if (keystroke_queue_.empty()) {
     return X_ERROR_EMPTY;
