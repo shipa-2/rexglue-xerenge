@@ -599,8 +599,23 @@ std::vector<std::string> Init(int argc, char** argv) {
     }
   }
 
+  // "--name=" with nothing after it sets a string to empty (an unbound key).
+  // CLI11 refuses it as a missing value, and a refusal drops every other
+  // argument with it, so these are taken out here and applied after.
+  std::vector<char*> args;
+  std::vector<std::string> empty_values;
+  for (int i = 0; i < argc; ++i) {
+    std::string_view arg(argv[i]);
+    if (i > 0 && arg.starts_with("--") && arg.size() > 3 && arg.back() == '=' &&
+        arg.find('=') == arg.size() - 1) {
+      empty_values.emplace_back(arg.substr(2, arg.size() - 3));
+      continue;
+    }
+    args.push_back(argv[i]);
+  }
+
   try {
-    app.parse(argc, argv);
+    app.parse(int(args.size()), args.data());
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
     //             dont call rex logging funcs here for now.
@@ -631,6 +646,20 @@ std::vector<std::string> Init(int argc, char** argv) {
     }
     std::lock_guard lock(GetRegistryMutex());
     GetPendingValuesStorage()[name].cmdline = std::move(value);
+  }
+  for (const std::string& name : empty_values) {
+    bool applied = false;
+    for (auto& entry : GetRegistryStorage()) {
+      if (entry.name == name && entry.type != FlagType::Boolean) {
+        ApplyFromSource(entry, "", Source::kCommandLine);
+        applied = true;
+        break;
+      }
+    }
+    if (!applied) {
+      std::lock_guard lock(GetRegistryMutex());
+      GetPendingValuesStorage()[name].cmdline = std::string();
+    }
   }
   g_init_done = true;
   return positional;

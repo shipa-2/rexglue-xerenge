@@ -163,6 +163,19 @@ MnkInputDriver::~MnkInputDriver() {
 }
 
 X_STATUS MnkInputDriver::Setup() {
+  if (REXCVAR_GET(mnk_mode)) {
+    REXLOG_INFO("mnk: A={} B={} X={} Y={} LB={} RB={} LT={} RT={} Start={} Back={}",
+                REXCVAR_GET(keybind_a), REXCVAR_GET(keybind_b), REXCVAR_GET(keybind_x),
+                REXCVAR_GET(keybind_y), REXCVAR_GET(keybind_left_shoulder),
+                REXCVAR_GET(keybind_right_shoulder), REXCVAR_GET(keybind_left_trigger),
+                REXCVAR_GET(keybind_right_trigger), REXCVAR_GET(keybind_start),
+                REXCVAR_GET(keybind_back));
+    REXLOG_INFO("mnk: stick {}/{}/{}/{} d-pad {}/{}/{}/{}", REXCVAR_GET(keybind_lstick_up),
+                REXCVAR_GET(keybind_lstick_down), REXCVAR_GET(keybind_lstick_left),
+                REXCVAR_GET(keybind_lstick_right), REXCVAR_GET(keybind_dpad_up),
+                REXCVAR_GET(keybind_dpad_down), REXCVAR_GET(keybind_dpad_left),
+                REXCVAR_GET(keybind_dpad_right));
+  }
   return X_STATUS_SUCCESS;
 }
 
@@ -372,6 +385,12 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     };
     const uint32_t now = uint32_t(buttons) | (lt ? 1u << 16 : 0u) | (rt ? 1u << 17 : 0u);
     const uint32_t changed = now ^ keystroke_buttons_;
+    if (changed != 0) {
+      // What the title is given, for telling a key that never arrives from
+      // one the title ignores (debug level: one line per change).
+      REXLOG_DEBUG("mnk: pad buttons {:04X} LT {} RT {}", uint32_t(buttons), lt ? 1 : 0,
+                   rt ? 1 : 0);
+    }
     for (uint32_t bit = 0; bit < 18; ++bit) {
       if ((changed & (1u << bit)) != 0 && kButtonKeys[bit] != rex::ui::VirtualKey::kNone &&
           keystroke_queue_.size() < 64) {
@@ -519,6 +538,9 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  if (vk < 256 && !key_down_[vk]) {
+    REXLOG_DEBUG("mnk: key down {:02X}", vk);
+  }
   SetKeyState(vk, true);
 }
 
