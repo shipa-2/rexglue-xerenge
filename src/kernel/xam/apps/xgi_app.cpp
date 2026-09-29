@@ -148,6 +148,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
       return X_E_SUCCESS;
     }
+    case 0x000B0013: {
+      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t xuid_array_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
+
+      REXKRNL_DEBUG("{}({:08X}, {})",
+                    xuid_array_ptr == 0 ? "XGISessionLeaveLocal" : "XGISessionLeaveRemote",
+                    session_ptr, user_count);
+      return X_E_SUCCESS;
+    }
     case 0x000B0014: {
       assert_true(!buffer_length || buffer_length == 16);
 

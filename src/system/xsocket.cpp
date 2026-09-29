@@ -152,7 +152,10 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
-  int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  // Ports below 1024 are privileged on Linux; the title uses 1000. Every build maps them the same way so peers still agree.
+  N_XSOCKADDR_IN mapped = *name;
+  mapped.sin_port = MapWirePort(uint16_t(name->sin_port));
+  int ret = bind(native_handle_, (sockaddr*)&mapped, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -235,7 +238,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   if (from) {
     from->sin_family = nfrom.sin_family;
     from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    from->sin_port = UnmapWirePort(ntohs(nfrom.sin_port));
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -263,11 +266,13 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   }
   */
 
-  sockaddr_in nto;
+  sockaddr_in nto = {};
   if (to) {
-    nto.sin_addr.s_addr = to->sin_addr;
-    nto.sin_family = to->sin_family;
-    nto.sin_port = to->sin_port;
+    // sin_addr and sin_port are already big-endian in memory, as the native struct wants.
+    std::memcpy(&nto.sin_addr, &to->sin_addr, sizeof(nto.sin_addr));
+    const rex::be<uint16_t> wire_port = MapWirePort(uint16_t(to->sin_port));
+    std::memcpy(&nto.sin_port, &wire_port, sizeof(nto.sin_port));
+    nto.sin_family = AF_INET;
   }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,

@@ -13,10 +13,14 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <vector>
+#include <chrono>
 #include <random>
 #include <string>
 #include <cstring>
@@ -524,23 +528,145 @@ u32 NetDll_WSAGetLastError_entry() {
   return XThread::GetLastError();
 }
 
+namespace {
+struct PendingRecv {
+  u32 socket_handle;
+  u32 overlapped;
+  u32 buf;
+  u32 buf_len;
+  u32 from;
+  u32 fromlen;
+};
+std::mutex g_pending_mutex;
+std::vector<PendingRecv> g_pending;
+std::map<u32, u32> g_completed;  // overlapped guest address -> byte count
+std::atomic<bool> g_poller_started{false};
+
+int TryRecvInto(const PendingRecv& p) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(p.socket_handle);
+  if (!socket) return -2;
+  auto* mem = REX_KERNEL_MEMORY();
+  N_XSOCKADDR_IN nfrom;
+  uint32_t nfromlen = 16;
+#ifdef MSG_DONTWAIT
+  const uint32_t flags = MSG_DONTWAIT;
+#else
+  const uint32_t flags = 0;
+#endif
+  int ret = socket->RecvFrom(mem->TranslateVirtual<uint8_t*>(p.buf), p.buf_len, flags, &nfrom,
+                             &nfromlen);
+  if (ret > 0 && p.from) {
+    auto* from = mem->TranslateVirtual<XSOCKADDR_IN*>(p.from);
+    from->sin_family = nfrom.sin_family;
+    from->sin_port = nfrom.sin_port;
+    from->sin_addr = nfrom.sin_addr;
+    std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
+    if (p.fromlen) *mem->TranslateVirtual<rex::be<uint32_t>*>(p.fromlen) = 16;
+  }
+  return ret;
+}
+
+void CompleteRecv(const PendingRecv& p, int ret) {
+  auto* mem = REX_KERNEL_MEMORY();
+  auto* ov = mem->TranslateVirtual<XWSAOVERLAPPED*>(p.overlapped);
+  ov->internal = 0;
+  ov->internal_high = uint32_t(ret);
+  {
+    std::lock_guard<std::mutex> lock(g_pending_mutex);
+    g_completed[p.overlapped] = uint32_t(ret);
+  }
+  if (OnlineStub()) REXKRNL_INFO("--online wire: recv complete ov {:08X} bytes {} event {:08X}", p.overlapped, ret, uint32_t(ov->event_handle));
+  if (ov->event_handle) xboxkrnl::xeNtSetEvent(ov->event_handle, nullptr);
+}
+
+void StartRecvPoller() {
+  if (g_poller_started.exchange(true)) return;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::vector<PendingRecv> work;
+      {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        work = g_pending;
+      }
+      { static int ticks = 0; if (OnlineStub() && ++ticks % 3000 == 1) REXKRNL_INFO("--online wire: poller tick {} pending {}", ticks, work.size()); }
+      for (const auto& p : work) {
+        int ret = TryRecvInto(p);
+        if (ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        REXKRNL_INFO("--online wire: poller recv socket {:08X} ret {} errno {}", p.socket_handle, ret, errno);
+        {
+          std::lock_guard<std::mutex> lock(g_pending_mutex);
+          for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
+            if (it->overlapped == p.overlapped) {
+              g_pending.erase(it);
+              break;
+            }
+          }
+        }
+        CompleteRecv(p, ret < 0 ? 0 : ret);
+      }
+    }
+  }).detach();
+}
+}  // namespace
+
 u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_ptr,
                              u32 buffer_count, mapped_u32 num_bytes_recv, mapped_u32 flags_ptr,
-                             ppc_ptr_t<XSOCKADDR_IN> from_addr,
-                             ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
+                             u32 from_addr, u32 fromlen_ptr, u32 overlapped_ptr,
                              mapped_void completion_routine_ptr) {
-  if (overlapped_ptr) {
-    // auto evt = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(
-    //    overlapped_ptr->event_handle);
-
-    // if (evt) {
-    //  //evt->Set(0, false);
-    //}
+  if (!buffer_count || !buffers_ptr) {
+    XThread::SetLastError(0x2726);  // WSAEINVAL
+    return -1;
   }
-
-  // we're not going to be receiving packets any time soon
-  // return error so we don't wait on that - Cancerous
+  PendingRecv p{socket,
+                overlapped_ptr,
+                buffers_ptr[0].buf_ptr,
+                buffers_ptr[0].len,
+                from_addr,
+                fromlen_ptr};
+  {
+    static std::atomic<int> n{0};
+    if (OnlineStub() && n++ < 20) REXKRNL_INFO("--online wire: WSARecvFrom socket {:08X} ov {:08X} buf {:08X} len {}", socket, overlapped_ptr, p.buf, p.buf_len);
+  }
+  int ret = TryRecvInto(p);
+  if (ret >= 0) {
+    if (num_bytes_recv) *num_bytes_recv = uint32_t(ret);
+    return 0;
+  }
+  if (ret == -2) {
+    XThread::SetLastError(0x2736);  // WSAENOTSOCK
+    return -1;
+  }
+  if (!(errno == EAGAIN || errno == EWOULDBLOCK) || !overlapped_ptr) {
+    XThread::SetLastError(0x2733);  // WSAEWOULDBLOCK
+    return -1;
+  }
+  auto* ov = REX_KERNEL_MEMORY()->TranslateVirtual<XWSAOVERLAPPED*>(overlapped_ptr);
+  ov->internal = 0x103;
+  if (ov->event_handle) xboxkrnl::xeNtClearEvent(ov->event_handle);
+  {
+    std::lock_guard<std::mutex> lock(g_pending_mutex);
+    g_completed.erase(overlapped_ptr);
+    g_pending.push_back(p);
+  }
+  StartRecvPoller();
+  XThread::SetLastError(0x3E5);  // WSA_IO_PENDING
   return -1;
+}
+
+u32 NetDll_WSAGetOverlappedResult_entry(u32 caller, u32 socket, u32 overlapped_ptr,
+                                        mapped_u32 transferred, u32 wait, mapped_u32 flags) {
+  std::lock_guard<std::mutex> lock(g_pending_mutex);
+  auto it = g_completed.find(overlapped_ptr);
+  if (OnlineStub()) { static std::atomic<int> n{0}; if (n++ < 6) REXKRNL_INFO("--online wire: GetOverlappedResult ov {:08X} found {}", overlapped_ptr, it != g_completed.end()); }
+  if (it == g_completed.end()) {
+    XThread::SetLastError(0x3E4);  // WSA_IO_INCOMPLETE
+    return 0;
+  }
+  if (transferred) *transferred = it->second;
+  if (flags) *flags = 0;
+  g_completed.erase(it);
+  return 1;
 }
 
 // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
@@ -596,10 +722,11 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
   }
 
   uint64_t timeout_wait = (uint64_t)timeout;
+  if (OnlineStub()) { static std::atomic<int> n{0}; if (n++ < 60) { std::string s; for (u32 i = 0; i < num_events; i++) s += fmt::format(" {:08X}", uint32_t(events[i])); REXKRNL_INFO("--online wire: WSAWait n {} timeout {} events{}", num_events, timeout, s); } }
 
   X_STATUS result = 0;
   do {
-    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
+    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all ? 0 : 1, 1, alertable,
                                                     timeout != -1 ? &timeout_wait : nullptr);
   } while (result == X_STATUS_ALERTED);
 
@@ -1373,6 +1500,7 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
+    REXKRNL_WARN("--online wire: bind socket {:08X} FAILED, errno {}", socket_handle, errno);
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
     return -1;
   }
@@ -1554,6 +1682,19 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   int ret = select(native_nfds, readfds ? &native_readfds : nullptr,
                    writefds ? &native_writefds : nullptr, exceptfds ? &native_exceptfds : nullptr,
                    timeout_in);
+  {
+    static int selLogs = 0;
+    if (host_readfds.count > 0 && (ret != 0 || selLogs < 3) && selLogs < 200) {
+      ++selLogs;
+      {
+        sockaddr_in me{};
+        socklen_t ml = sizeof(me);
+        getsockname(host_readfds.sockets[0]->native_handle(), reinterpret_cast<sockaddr*>(&me), &ml);
+        REXKRNL_INFO("--online wire: select socket bound at {}:{} fd {}", inet_ntoa(me.sin_addr), ntohs(me.sin_port), int(host_readfds.sockets[0]->native_handle()));
+      }
+      REXKRNL_INFO("--online wire: select read-set of {} socket(s), first {:08X}, nfds {} -> {}", host_readfds.count, uint32_t(host_readfds.sockets[0]->handle()), native_nfds, ret);
+    }
+  }
   if (readfds) {
     host_readfds.UpdateFrom(&native_readfds);
     host_readfds.Store(readfds);
@@ -1604,6 +1745,16 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
+  if (OnlineStub() && ret < 0) {
+    static std::atomic<int> failures{0};
+    if (failures++ < 12) {
+      REXKRNL_INFO("--online wire: recvfrom socket {:08X} failed, errno {}", socket_handle, errno);
+    }
+  }
+  if (OnlineStub() && ret > 0) {
+    REXKRNL_INFO("--online wire: recvfrom socket {:08X} {} byte(s) from {:08X}:{}", socket_handle, ret,
+                 uint32_t(native_from.sin_addr), uint16_t(native_from.sin_port));
+  }
 
   if (from_ptr) {
     from_ptr->sin_family = native_from.sin_family;
@@ -1695,6 +1846,11 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
 
   N_XSOCKADDR_IN native_to(to_ptr);
   const int sent = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  if (OnlineStub()) {
+    const uint32_t ip = native_to.sin_addr;
+    REXKRNL_INFO("--online wire: sendto socket {:08X} to {:08X}:{} len {} tolen {} -> {} errno {}", socket_handle, ip,
+                 uint16_t(native_to.sin_port), buf_len, to_len, sent, sent < 0 ? errno : 0);
+  }
   if (sent < 0) {
     SetLastSocketError();
   }
@@ -1788,7 +1944,7 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
 REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
 REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
 REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
-REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
+REX_EXPORT(__imp__NetDll_WSAGetOverlappedResult, rex::kernel::xam::NetDll_WSAGetOverlappedResult_entry)
 REX_EXPORT_STUB(__imp__NetDll_WSARecv);
 REX_EXPORT_STUB(__imp__NetDll_WSASend);
 REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);

@@ -48,6 +48,9 @@ struct XSOCKADDR_IN {
 };
 
 // Xenia native sockaddr_in
+inline uint16_t MapWirePort(uint16_t port) { return (port != 0 && port < 1024) ? uint16_t(port + 30000) : port; }
+inline uint16_t UnmapWirePort(uint16_t port) { return (port >= 30001 && port < 31024) ? uint16_t(port - 30000) : port; }
+
 struct N_XSOCKADDR_IN {
   N_XSOCKADDR_IN() {}
   N_XSOCKADDR_IN(const XSOCKADDR_IN* other) { *this = *other; }
