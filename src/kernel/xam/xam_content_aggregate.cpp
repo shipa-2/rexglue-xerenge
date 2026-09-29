@@ -100,7 +100,7 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
 
   auto content_type_enum = XContentType(uint32_t(content_type));
 
-  uint64_t userxuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t userxuid = REX_KERNEL_STATE()->user_profile()->save_xuid();
 
   if (!device_info || device_info->device_type == DeviceType::HDD) {
     // Fetch any alternate title IDs defined in the XEX header

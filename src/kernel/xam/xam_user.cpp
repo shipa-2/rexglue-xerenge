@@ -117,6 +117,8 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
+  REXKRNL_INFO("XamUserGetName(user {}, buffer {:08X}, length {}) -> \"{}\"", user_index,
+               buffer.guest_address(), buffer_len, user_name);
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }

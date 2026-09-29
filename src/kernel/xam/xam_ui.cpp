@@ -29,6 +29,8 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+REXCVAR_DECLARE(std::string, gamertag);
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -421,7 +423,7 @@ class KeyboardInputDialog : public XamDialog {
 u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text,
                             mapped_wstring title, mapped_wstring description, mapped_wstring buffer,
                             u32 buffer_length, mapped_void overlapped) {
-  REXKRNL_DEBUG("XamShowKeyboardUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
+  REXKRNL_INFO("XamShowKeyboardUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
                 uint32_t(user_index), uint32_t(flags), default_text.guest_address(),
                 title.guest_address(), description.guest_address(), buffer.guest_address(),
                 uint32_t(buffer_length), overlapped.guest_address());
@@ -478,6 +480,8 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                            REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
                      : "";
 
+    REXKRNL_INFO("XamShowKeyboardUI: title \"{}\" description \"{}\" default \"{}\" max {}; imgui {}", title_str,
+                 desc_str, def_text_str, uint32_t(buffer_length), imgui_drawer != nullptr);
     if (imgui_drawer) {
       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
@@ -485,13 +489,16 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                                   buffer_length_safe),
           close, overlapped.guest_address());
     } else {
-      // Fallback to headless
-      auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
-        if (!default_text) {
-          std::memset(buffer, 0, buffer_size);
-        } else {
-          rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
-        }
+      // No dialog to draw: the player's gamertag answers (a name for their
+      // player file), or the default text when none is set.
+      std::string answer = REXCVAR_GET(gamertag).empty() ? def_text_str : REXCVAR_GET(gamertag);
+      if (buffer_length > 0 && answer.size() > buffer_length - 1) {
+        answer.resize(buffer_length - 1);
+      }
+      auto run = [answer, buffer, buffer_length, buffer_size]() -> X_RESULT {
+        std::memset(buffer, 0, buffer_size);
+        rex::string::copy_and_swap_truncating(buffer, rex::string::to_utf16(answer),
+                                              buffer_length);
         return X_ERROR_SUCCESS;
       };
       result = xeXamDispatchHeadless(run, overlapped.guest_address());

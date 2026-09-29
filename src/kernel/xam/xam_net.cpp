@@ -575,6 +575,12 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
+  if (OnlineStub()) {
+    const uint32_t ip = native_to.sin_addr;
+    REXKRNL_INFO("--online wire: sendto socket {:08X} to {}.{}.{}.{}:{}, {} byte(s)", socket_handle,
+                 ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
+                 uint16_t(native_to.sin_port), combined_buffer_size);
+  }
   socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags, &native_to, to_len);
 
   // TODO: Instantly complete overlapped
@@ -746,6 +752,7 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
       std::memcpy(copy.data(), static_cast<XNADDR*>(xn_addr), sizeof(XNADDR));
       g_known_xnaddrs[address] = copy;
     }
+    REXKRNL_INFO("--online wire: XNetXnAddrToInAddr -> {:08X}", htonl(address));
     std::memcpy(in_addr, &address, sizeof(address));
     return 0;
   }
@@ -796,10 +803,16 @@ struct XEthernetStatus {
 // without it these stay what the old stubs returned (the caller argument, 1 -
 // an error to XNetConnect, "pending" to XNetGetConnectStatus).
 u32 NetDll_XNetConnect_entry(u32 caller, u32 in_addr) {
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: XNetConnect {:08X}", in_addr);
+  }
   return OnlineStub() ? 0 : 1;
 }
 
 u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 in_addr) {
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: XNetGetConnectStatus {:08X}", in_addr);
+  }
   constexpr uint32_t kConnectStatusConnected = 2;  // XNET_CONNECT_STATUS_CONNECTED
   return OnlineStub() ? kConnectStatusConnected : 1;
 }
@@ -1177,6 +1190,44 @@ u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey)
   return 0;
 }
 
+// XSessionCreate as a host: the title reads its XSESSION_INFO back - the
+// session's key id (an online peer XNKID, as XNetCreateKey makes), this
+// console's XNADDR (as XNetGetTitleXnAddr gives it) and the key exchange key -
+// and hands it to the lobby, for the players who join to connect with. Left
+// zero, Burnout gave up on the game it had just created ("the game you were
+// in no longer exists").
+bool FillHostSessionInfo(uint8_t* info, uint8_t* nonce) {
+  if (!OnlineStub()) {
+    return false;
+  }
+  static std::mt19937_64 random{std::random_device{}()};
+  std::lock_guard lock(g_online_mutex);
+  if (info) {
+    uint8_t* kid = info;
+    for (int i = 0; i < 8; ++i) {
+      kid[i] = uint8_t(random());
+    }
+    kid[0] = uint8_t((kid[0] & 0x0F) | 0x80);
+    auto* host = reinterpret_cast<XNADDR*>(info + 8);
+    std::memset(host, 0, sizeof(XNADDR));
+    const uint32_t address = OnlineLocalAddress();
+    host->ina.s_addr = address;
+    host->inaOnline.s_addr = address;
+    host->wPortOnline = 3074;
+    FillConsoleIdentity(address, host->abEnet, host->abOnline);
+    uint8_t* key = info + 8 + sizeof(XNADDR);
+    for (int i = 0; i < 16; ++i) {
+      key[i] = uint8_t(random());
+    }
+  }
+  if (nonce) {
+    for (int i = 0; i < 8; ++i) {
+      nonce[i] = uint8_t(random());
+    }
+  }
+  return true;
+}
+
 u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
   return OnlineStub() ? 0 : 1;
 }
@@ -1215,6 +1266,9 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
 }
 
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: socket af {} type {} protocol {}", af, type, protocol);
+  }
   auto socket = object_ref<XSocket>(new XSocket(REX_KERNEL_STATE()));
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
@@ -1312,6 +1366,11 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   if (OnlineStub() && !REXCVAR_GET(online_address).empty() && native_name.sin_addr == 0u) {
     native_name.sin_addr = ntohl(OnlineLocalAddress());
   }
+  if (OnlineStub()) {
+    const uint32_t ip = native_name.sin_addr;
+    REXKRNL_INFO("--online wire: bind socket {:08X} to {}.{}.{}.{}:{}", socket_handle, ip >> 24,
+                 (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, uint16_t(native_name.sin_port));
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -1346,6 +1405,9 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
 }
 
 u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
+  if (OnlineStub()) {
+    REXKRNL_INFO("--online wire: listen socket {:08X}", socket_handle);
+  }
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
     // WSAENOTSOCK

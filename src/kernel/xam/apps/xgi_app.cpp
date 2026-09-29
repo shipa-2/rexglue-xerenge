@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+#include <rex/kernel/xam/online.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -113,6 +114,13 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
           nonce_ptr);
+      // XSESSION_CREATE_HOST: the session info and nonce are this console's to
+      // make (a joiner passes in the host's instead).
+      if ((flags & 0x1u) != 0) {
+        FillHostSessionInfo(
+            session_info_ptr ? memory_->TranslateVirtual<uint8_t*>(session_info_ptr) : nullptr,
+            nonce_ptr ? memory_->TranslateVirtual<uint8_t*>(nonce_ptr) : nullptr);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0011: {

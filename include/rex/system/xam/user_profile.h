@@ -217,6 +217,9 @@ class UserProfile {
   UserProfile();
 
   uint64_t xuid() const { return xuid_; }
+  // Where content (saves) is kept: the same for every name, so changing the
+  // gamertag does not lose them.
+  uint64_t save_xuid() const { return 0xB13EBABEBABEBABE; }
   std::string name() const { return name_; }
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }

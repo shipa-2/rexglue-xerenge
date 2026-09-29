@@ -13,9 +13,16 @@
 
 #include <fmt/format.h>
 
+#include <cstdlib>
+
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DECLARE(std::string, online_address);
+REXCVAR_DEFINE_STRING(gamertag, "", "Network",
+                      "The player's name (gamertag), shown to others online; up to 15 characters");
 
 namespace rex {
 namespace system {
@@ -27,6 +34,30 @@ UserProfile::UserProfile() {
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
   name_ = "User";
+  // The name is the gamertag setting; the XUID follows from it, so players with
+  // other names are other players. Copies on one machine with the same name
+  // still differ by their --online_address.
+  {
+    std::string name = REXCVAR_GET(gamertag);
+    if (name.size() > 15) {
+      name.resize(15);
+    }
+    const std::string address = REXCVAR_GET(online_address);
+    const size_t dot = address.rfind('.');
+    const uint64_t last =
+        dot == std::string::npos ? 0 : (std::strtoul(address.c_str() + dot + 1, nullptr, 10) & 0xFF);
+    if (name.empty() && dot != std::string::npos) {
+      name = fmt::format("User{}", last);
+    }
+    if (!name.empty()) {
+      uint32_t hash = 2166136261u;
+      for (unsigned char c : name) {
+        hash = (hash ^ c) * 16777619u;
+      }
+      name_ = name;
+      xuid_ = (xuid_ & ~0xFFFFFFFFull) | (hash ^ uint32_t(last));
+    }
+  }
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

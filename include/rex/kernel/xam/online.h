@@ -25,4 +25,9 @@ uint32_t OnlineServiceAddress();
 // LAN.
 uint32_t OnlineLocalAddress();
 
+// --online: an XSESSION_INFO for a session this console creates as its host,
+// written at `info` (60 bytes: XNKID, the host's XNADDR, XNKEY) and a nonce at
+// `nonce` (8 bytes) - either may be null. False when not online.
+bool FillHostSessionInfo(uint8_t* info, uint8_t* nonce);
+
 }  // namespace rex::kernel::xam
