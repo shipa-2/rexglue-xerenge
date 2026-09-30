@@ -294,7 +294,7 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
  * @param ctx The builder context
  * @param ptr_type The pointer type (e.g., "uint32_t", "uint64_t")
  * @param bswap_func The byte-swap builtin (e.g., "__builtin_bswap32")
- * @param field The register field (e.g., "s32", "s64")
+ * @param field The register field (e.g., "u32", "u64")
  */
 inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type,
                                        const char* bswap_func, const char* field) {
