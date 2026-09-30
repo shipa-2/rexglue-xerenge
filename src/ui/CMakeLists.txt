@@ -157,6 +157,11 @@ if(UNIX AND NOT APPLE)
         ${X11_XCB_INCLUDE_DIRS}
         ${WAYLAND_INCLUDE_DIRS}
     )
+    # For the targets that include ui/vulkan/api.h without linking rexui (the GPU
+    # plugins). A native build finds the headers in /usr/include regardless; a
+    # cross build has them only where pkg-config says.
+    set(REX_WINDOW_SYSTEM_INCLUDE_DIRS ${X11_XCB_INCLUDE_DIRS} ${WAYLAND_INCLUDE_DIRS}
+        CACHE INTERNAL "X11 and Wayland header directories")
     target_link_libraries(rexui PUBLIC
         ${X11_XCB_LIBRARIES}
         ${WAYLAND_LIBRARIES}

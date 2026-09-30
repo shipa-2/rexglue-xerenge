@@ -108,6 +108,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
+    ${REX_WINDOW_SYSTEM_INCLUDE_DIRS}
 )
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
