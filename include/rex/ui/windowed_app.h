@@ -24,10 +24,9 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
-#endif
+// XE_UI_WINDOWED_APPS_IN_LIBRARY (several apps in one library) was Xenia's
+// Android arrangement. Here Android runs one app too: SDL loads it from
+// libmain.so and calls SDL_main (windowed_app_main_sdl.cpp).
 
 namespace rex {
 namespace ui {

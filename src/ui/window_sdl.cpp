@@ -37,6 +37,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -391,6 +393,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
         return std::make_unique<CAMetalLayerSurface>(sdl_window_, metal_view, layer);
       }
       SDL_Metal_DestroyView(metal_view);
+    }
+  }
+#elif REX_PLATFORM_ANDROID
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    auto* window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (window) {
+      return std::make_unique<AndroidNativeWindowSurface>(window);
     }
   }
 #else

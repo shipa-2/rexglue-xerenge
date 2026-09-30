@@ -777,6 +777,17 @@ add_library(libswresample STATIC
     ${FFMPEG_DIR}/libswresample/swresample_frame.c
     ${FFMPEG_OVERLAY_BUILD_DIR}/libswresample/swresample_dsp_x86_stub.c
 )
+# On ARM64 the configs enable ARCH_AARCH64, and resample_dsp.c and
+# audioconvert.c call the aarch64 init functions: take FFmpeg's own NEON code.
+if(IS_ARM64)
+    target_sources(libswresample PRIVATE
+        ${FFMPEG_DIR}/libswresample/aarch64/audio_convert_init.c
+        ${FFMPEG_DIR}/libswresample/aarch64/audio_convert_neon.S
+        ${FFMPEG_DIR}/libswresample/aarch64/resample_init.c
+        ${FFMPEG_DIR}/libswresample/aarch64/resample.S
+    )
+    target_include_directories(libswresample PRIVATE "${FFMPEG_ATOMICS_INCLUDE}")
+endif()
 target_include_directories(libswresample BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 target_include_directories(libswresample
     PUBLIC

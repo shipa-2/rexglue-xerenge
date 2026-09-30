@@ -10,6 +10,10 @@
  */
 
 #include <cerrno>
+#include <rex/platform.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/main_android.h>
+#endif
 #include <cstddef>
 #include <cstdio>
 #include <cstring>

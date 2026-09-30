@@ -74,6 +74,10 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
+    if(ANDROID)
+        target_sources(rexcore PRIVATE main_android.cpp fiber_android.cpp filesystem_android.cpp)
+        target_link_libraries(rexcore PUBLIC android log PRIVATE SDL3::SDL3)
+    endif()
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
@@ -100,6 +104,9 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)
+    # Bionic keeps pthreads and the realtime functions in libc itself.
+    target_link_libraries(rexcore PRIVATE dl)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

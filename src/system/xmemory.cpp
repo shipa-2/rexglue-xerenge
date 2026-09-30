@@ -30,7 +30,7 @@
 #include <rex/system/xmemory.h>
 
 #include <atomic>
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)  // bionic: backtrace() only from API 33
 #include <dlfcn.h>
 #include <execinfo.h>
 #endif
@@ -553,7 +553,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
     // Once per process, the host stack: the recompiled code runs as native
     // functions named after their guest address (sub_XXXXXXXX), so this says
     // which guest function faulted. Frames are "module+offset", for addr2line.

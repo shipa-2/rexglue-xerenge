@@ -18,6 +18,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/main_android.h>
 #include <rex/platform.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
@@ -122,6 +123,15 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
     argv_ptrs.push_back(s.data());
   }
   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+}
+
+#elif REX_PLATFORM_ANDROID
+
+// SDLActivity loads libmain.so and calls SDL_main from its own thread; there is
+// no process-level main() on Android.
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
+  rex::InitializeAndroidApp();
+  return RunWindowedApp(argc, argv);
 }
 
 #else
