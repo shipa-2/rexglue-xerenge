@@ -19,6 +19,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -91,6 +94,15 @@ std::filesystem::path GetExecutablePath() {
   std::error_code ec;
   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
   return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif defined(__ANDROID__)
+  // The process is app_process64; what the app ships is the native library
+  // directory the runtime was loaded from (extractNativeLibs puts the .so files
+  // there), which is where the GPU plugins lie too.
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void*>(&GetExecutablePath), &info) && info.dli_fname) {
+    return std::filesystem::path(info.dli_fname);
+  }
+  return {};
 #else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);
