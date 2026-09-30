@@ -114,10 +114,19 @@ endmacro()
 # codegen, including one a project assembles itself rather than taking the
 # library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
 # names it.
+# The code generator runs on the build machine. A cross build makes one for the
+# target, which is run through CMAKE_CROSSCOMPILING_EMULATOR unless REXGLUE_CODEGEN
+# names a host build of it (the SDK's out/<host preset>/Release/rexglue).
+set(REXGLUE_CODEGEN "" CACHE FILEPATH "Code generator to run instead of the one this build makes")
+if(REXGLUE_CODEGEN)
+    set(REXGLUE_CODEGEN_COMMAND "{{ cmake_var("REXGLUE_CODEGEN") }}")
+else()
+    set(REXGLUE_CODEGEN_COMMAND {{ cmake_var("CMAKE_CROSSCOMPILING_EMULATOR") }} $<TARGET_FILE:rex::rexglue>)
+endif()
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    COMMAND {{ cmake_var("REXGLUE_CODEGEN_COMMAND") }} codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"

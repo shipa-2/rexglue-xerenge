@@ -427,6 +427,11 @@ configure_file(
   "${FFMPEG_OVERLAY_SRC_DIR}/bsf_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/bsf_list.c"
   COPYONLY
 )
+file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libavformat")
+configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/protocol_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavformat/protocol_list.c"
+  COPYONLY
+)
 file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libswresample")
 configure_file(
   "${FFMPEG_OVERLAY_SRC_DIR}/swresample_dsp_x86_stub.c"
@@ -706,11 +711,12 @@ endif()
 # Curated to ASF (WMA) and MP3, the two container formats XMP songs come in;
 # no muxers, and just the "file" protocol, since playback reads through the
 # guest's own VFS via a custom AVIOContext rather than a URL. The demuxer,
-# muxer and protocol lists are not overlay files like codec_list.c above -
-# libavformat/demuxer_list.c, muxer_list.c and protocol_list.c already exist at
-# their real path in the vendored tree, already curated to exactly this set,
-# and are pulled in by #include from allformats.c/protocols.c, so they are not
-# listed as sources here.
+# and muxer lists are not overlay files like codec_list.c above -
+# libavformat/demuxer_list.c and muxer_list.c already exist at their real path
+# in the vendored tree, already curated to exactly this set, and are pulled in
+# by #include from allformats.c, so they are not listed as sources here. The
+# protocol list is an overlay (ffmpeg-overlay/protocol_list.c): the vendored
+# one breaks the aarch64 configs.
 add_library(libavformat STATIC
     ${FFMPEG_DIR}/libavformat/allformats.c
     ${FFMPEG_DIR}/libavformat/avio.c
@@ -752,6 +758,8 @@ target_include_directories(libavformat
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+# protocols.c takes its list from the overlay (see ffmpeg-overlay/protocol_list.c).
+target_include_directories(libavformat BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 target_compile_definitions(libavformat PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavformat PRIVATE -w)
 target_link_libraries(libavformat PUBLIC libavcodec libavutil)
