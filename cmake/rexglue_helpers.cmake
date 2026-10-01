@@ -44,6 +44,11 @@ endfunction()
 # Applied to both host apps and guest DLL modules. Compile/link flags only;
 # runtime DLL staging is the host's job (see rexglue_configure_target).
 #==========================================================
+# The aarch64 baseline the game code is built for. armv8.2-a brings LSE
+# atomics (single instructions instead of calls to outline helpers) - every
+# phone core since about 2018 has it; armv8-a keeps the oldest ones.
+set(REXGLUE_ARM64_MARCH "armv8-a" CACHE STRING "-march for aarch64 game targets")
+
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
         # Large executable support
@@ -51,7 +56,7 @@ function(rexglue_apply_target_settings target_name)
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            target_compile_options(${target_name} PRIVATE -march=${REXGLUE_ARM64_MARCH})
         endif()
     endif()
 
