@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <atomic>
 #include <array>
 #include <filesystem>
@@ -680,10 +681,22 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
-  // Pump SDL events to ensure controller state is up to date.
+  // Pump SDL events to ensure controller state is up to date - at most every
+  // 4 ms. The title asks for the pad state many times a frame, and each ask
+  // queued a pump as soon as the last one finished, so the UI thread pumped
+  // without pause: on a phone it held one of the two big cores at 100%
+  // (SDL_UpdateJoysticks, its locks and the clock). Real input events wake the
+  // UI loop by themselves.
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (now - sdl_pumpevents_last_ns_.load(std::memory_order_relaxed) < 4000000) {
+    return;
+  }
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
+    sdl_pumpevents_last_ns_.store(now, std::memory_order_relaxed);
     attached_window_->app_context().CallInUIThread([this]() {
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;

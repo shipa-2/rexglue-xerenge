@@ -95,6 +95,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // When QueueControllerUpdate last queued a pump (steady clock, ns).
+  std::atomic<int64_t> sdl_pumpevents_last_ns_{0};
   // Appended in connection order, never re-sorted, and unbounded: the
   // assignment decides how many the guest sees.
   std::vector<ControllerState> controllers_;
