@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 
 #include <SDL3/SDL_events.h>
@@ -59,6 +61,11 @@ class SDLWindowedAppContext final : public WindowedAppContext {
   uint32_t paint_event_type_ = 0;
   uint32_t synchronously_handled_quit_events_ = 0;
   bool event_watch_registered_ = false;
+  // Android: the UI loop sleeps on this rather than in SDL_WaitEvent (see
+  // RunMainMessageLoop); NotifyUILoopOfPendingFunctions wakes it.
+  std::mutex ui_wake_mutex_;
+  std::condition_variable ui_wake_cv_;
+  bool ui_wake_pending_ = false;
 };
 
 }  // namespace rex::ui

@@ -11,7 +11,9 @@
 
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -76,6 +78,13 @@ void SDLWindowedAppContext::NotifyUILoopOfPendingFunctions() {
   SDL_Event event{};
   event.type = wakeup_event_type_;
   SDL_PushEvent(&event);
+#if REX_PLATFORM_ANDROID
+  {
+    std::lock_guard lock(ui_wake_mutex_);
+    ui_wake_pending_ = true;
+  }
+  ui_wake_cv_.notify_one();
+#endif
 }
 
 void SDLWindowedAppContext::PlatformQuitFromUIThread() {
@@ -85,11 +94,43 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
 }
 
 int SDLWindowedAppContext::RunMainMessageLoop() {
+  // What wakes the UI thread, by event type, every five seconds: on a phone it
+  // held a big core at 100% inside SDL_WaitEvent, so how often it wakes, and
+  // for what, is worth seeing.
+  std::map<uint32_t, uint32_t> woken_by;
+  uint32_t wakes = 0;
+  auto report_at = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!HasQuitFromUIThread()) {
     SDL_Event event;
+#if REX_PLATFORM_ANDROID
+    // SDL 3.4 on Android spins in SDL_WaitEvent: each pump re-queues its poll
+    // sentinel, adding an event sends Android a wake-up, and the wait for the
+    // next one returns at once - a big core at 100% on a phone with two. So poll,
+    // and sleep here until something is posted to the UI thread or 4 ms pass
+    // (touch and lifecycle events are picked up by the next poll).
+    if (!SDL_PollEvent(&event)) {
+      std::unique_lock lock(ui_wake_mutex_);
+      ui_wake_cv_.wait_for(lock, std::chrono::milliseconds(4), [this] { return ui_wake_pending_; });
+      ui_wake_pending_ = false;
+      continue;
+    }
+#else
     if (!SDL_WaitEvent(&event)) {
       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
       return EXIT_FAILURE;
+    }
+#endif
+    ++wakes;
+    ++woken_by[event.type];
+    if (const auto now = std::chrono::steady_clock::now(); now >= report_at) {
+      std::string types;
+      for (const auto& [type, count] : woken_by) {
+        types += fmt::format(" {:X}x{}", type, count);
+      }
+      REXLOG_INFO("UI thread: {} events in 5 s, by type:{}", wakes, types);
+      woken_by.clear();
+      wakes = 0;
+      report_at = now + std::chrono::seconds(5);
     }
     ProcessEvent(event);
   }
