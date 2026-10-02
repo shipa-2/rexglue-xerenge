@@ -186,7 +186,7 @@ class IGraphicsSystem {
     // Drawn by the title's 2D layer (interface, menus) rather than its 3D
     // scene: on a screen wider than 16:9 the scene widens and these keep the
     // console's 16:9 box.
-    bool interface = false;
+    bool from_interface = false;  // not "interface": a macro on Windows
     // ... with its box against the screen's left edge rather than centred
     // (the music player's panel).
     bool interface_left = false;
