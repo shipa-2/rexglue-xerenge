@@ -98,6 +98,23 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005000B: {
+      // XStringVerify: Live's check of player-entered text for profanity.
+      // Failing it read as a verdict - Burnout Revenge refused every clip
+      // comment as profane and asked again. With no Live to ask, every string
+      // passes. The request is logged once, to fill in the per-string results
+      // should a title read them.
+      static bool logged = false;
+      if (!logged && buffer && buffer_length >= 4) {
+        logged = true;
+        std::string words;
+        for (uint32_t i = 0; i + 4 <= buffer_length && i < 0x40; i += 4) {
+          words += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(buffer + i));
+        }
+        REXKRNL_INFO("XStringVerify({:08X}, {:08X}): passed;{}", buffer_ptr, buffer_length, words);
+      }
+      return X_E_SUCCESS;
+    }
   }
   REXKRNL_ERROR(
       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "

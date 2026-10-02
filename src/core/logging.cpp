@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
@@ -49,6 +50,18 @@ REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log ma
 
 REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
     .range(0, 60)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// The log file rotates: past this size it is renamed (name.1.ext, ...) and a
+// new one started, so a run stuck repeating one line cannot fill the disk -
+// an access violation retried forever wrote 11 GB on a phone until nothing
+// else could be installed.
+REXCVAR_DEFINE_INT32(log_max_file_size_mb, 32, "Log",
+                     "Log file size before it rotates, in MB (0 = never rotate)")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(log_max_files, 3, "Log", "Rotated log files kept beside the current one")
+    .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -268,7 +281,14 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    const int32_t max_mb = REXCVAR_GET(log_max_file_size_mb);
+    spdlog::sink_ptr sink;
+    if (max_mb > 0) {
+      sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+          resolved_path.string(), size_t(max_mb) << 20, size_t(REXCVAR_GET(log_max_files)), false);
+    } else {
+      sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    }
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;

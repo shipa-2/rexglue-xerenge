@@ -183,6 +183,16 @@ class IGraphicsSystem {
     // applied) and stride in bytes. Stream i is vertex fetch constant 95 - i.
     uint32_t stream_address[4] = {};
     uint32_t stream_stride[4] = {};
+    // Drawn by the title's 2D layer (interface, menus) rather than its 3D
+    // scene: on a screen wider than 16:9 the scene widens and these keep the
+    // console's 16:9 box.
+    bool interface = false;
+    // ... with its box against the screen's left edge rather than centred
+    // (the music player's panel).
+    bool interface_left = false;
+    // Which of the title's 2D objects the draw belongs to (0: none): the draws
+    // of one object - a panel and its text - move to the same edge together.
+    uint32_t interface_object = 0;
   };
   virtual void NoteGuestDraw(uint32_t primitive_type, uint32_t index_count,
                              const GuestDrawBuffers& buffers) {
