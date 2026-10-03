@@ -239,9 +239,18 @@ bool ReplayPad(input::X_INPUT_GAMEPAD* pad, uint64_t poll) {
   if (track.empty()) {
     return false;
   }
-  const uint64_t now = poll;
+  // XERENGE_REPLAY_BY_TIME: followed by the milliseconds the recording keeps
+  // beside each read rather than by the read count. With the frame rate
+  // unlocked the title reads the pad every drawn frame - a thousand times a
+  // second in the menus against the sixty it was recorded at - while its logic
+  // still runs in real time, so the read count ran the recording through in
+  // seconds and the clock keeps it on its screens.
+  static const bool by_time = std::getenv("XERENGE_REPLAY_BY_TIME") != nullptr;
+  const uint64_t now = by_time ? PadClockMs() : poll;
+  const auto due = [](const PadSample& s) { return by_time ? s.at_ms : s.at_poll; };
   static size_t cursor = 0;
   static uint32_t delivered = 0;
+  static uint64_t delivered_since = 0;
   // A press must survive the difference between the run that recorded it and
   // the run replaying it: loading takes a different number of frames, so poll
   // indices drift, and a press recorded only a few polls long can land wholly
@@ -250,7 +259,9 @@ bool ReplayPad(input::X_INPUT_GAMEPAD* pad, uint64_t poll) {
   // anyway, so a longer press is read the same as a short one, while a press
   // too short to be seen is read as nothing at all.
   constexpr uint32_t kMinHoldPolls = 8;
-  ++delivered;
+  if (delivered++ == 0) {
+    delivered_since = now;
+  }
   // Advance by at most one sample per read. Jumping straight to the latest
   // sample due by now skips any whose successor also came due in the same
   // gap - and a press and its release are tens of milliseconds apart, so a
@@ -259,13 +270,26 @@ bool ReplayPad(input::X_INPUT_GAMEPAD* pad, uint64_t poll) {
   // once, which is what actually presses the button.
   const bool neutral = track[cursor].buttons == 0 && track[cursor].left_trigger == 0 &&
                        track[cursor].right_trigger == 0;
-  const bool held_long_enough = neutral || delivered >= kMinHoldPolls;
-  if (held_long_enough && cursor + 1 < track.size() && track[cursor + 1].at_poll <= now) {
+  // By time, a press is held for three logic steps however often the pad is read.
+  // Only a change of buttons has to be held: a button kept down across many
+  // samples while the sticks move (most of a race) put the replay seconds behind.
+  const bool same_buttons = cursor + 1 < track.size() &&
+                            track[cursor + 1].buttons == track[cursor].buttons &&
+                            track[cursor + 1].left_trigger == track[cursor].left_trigger &&
+                            track[cursor + 1].right_trigger == track[cursor].right_trigger;
+  const bool held_long_enough =
+      neutral || (by_time && same_buttons) ||
+      (by_time ? now - delivered_since >= 50 : delivered >= kMinHoldPolls);
+  if (held_long_enough && cursor + 1 < track.size() && due(track[cursor + 1]) <= now) {
     ++cursor;
     delivered = 0;
+    if (by_time && track[cursor].buttons != track[cursor - 1].buttons) {
+      REXKRNL_INFO("pad replay: sample {} (recorded at {} ms) buttons {:04X} given at {} ms", cursor,
+                   track[cursor].at_ms, track[cursor].buttons, now);
+    }
   }
   const PadSample& s = track[cursor];
-  if (s.at_poll > now) {
+  if (due(s) > now) {
     return false;
   }
   pad->buttons = s.buttons;
