@@ -416,6 +416,10 @@ set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
 set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
 file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec")
 configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/config.h.in" "${FFMPEG_OVERLAY_BUILD_DIR}/config.h"
+  @ONLY
+)
+configure_file(
   "${FFMPEG_OVERLAY_SRC_DIR}/codec_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/codec_list.c"
   COPYONLY
 )
@@ -571,6 +575,7 @@ target_include_directories(libavutil
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
 )
+target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
 if(WIN32)
