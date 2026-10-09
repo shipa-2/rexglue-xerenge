@@ -1220,7 +1220,9 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 xnaddr_count, mapped_u32 xnaddrs,
         FD_SET(s, &readable);
         const auto left =
             std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-        timeval wait{long(left / 1000000), long(left % 1000000)};
+        timeval wait{};
+        wait.tv_sec = left / 1000000;
+        wait.tv_usec = left % 1000000;
         if (::select(int(s) + 1, &readable, nullptr, nullptr, &wait) <= 0) {
           break;
         }
