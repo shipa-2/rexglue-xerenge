@@ -24,6 +24,9 @@
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/window_sdl.h>
+#if REX_PLATFORM_MAC
+#include "vulkan/vulkan_moltenvk.h"
+#endif
 
 namespace rex::ui {
 
@@ -52,6 +55,18 @@ bool SDLWindowedAppContext::Initialize() {
   if (!requested_driver.empty()) {
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());
   }
+#if REX_PLATFORM_MAC
+  // A GPU plugin that makes its own Vulkan instance through SDL never runs
+  // VulkanInstance::Create, so the loader and MoltenVK staged beside the
+  // executable have to be found here. SDL only tries bare library names,
+  // which miss /opt/homebrew/lib, and the loader does not look next to
+  // itself for the ICD. A path the user set in the environment wins.
+  const vulkan::MacOSVulkanRuntimePaths vulkan_paths = vulkan::DetectMacOSVulkanRuntimePaths();
+  vulkan::ConfigureMacOSVulkanEnvironment(vulkan_paths);
+  if (!vulkan_paths.loader_candidates.empty() && !SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
+    SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, vulkan_paths.loader_candidates.front().string().c_str());
+  }
+#endif
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
     REXLOG_ERROR("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
     return false;

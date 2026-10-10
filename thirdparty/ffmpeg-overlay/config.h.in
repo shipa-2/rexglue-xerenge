@@ -1,0 +1,45 @@
+/* The platform config, and on macOS the components this build compiles set to
+ * match it. The source lists in thirdparty/CMakeLists.txt build libavformat for
+ * ASF and MP3 (the containers XMP songs come in) and libavcodec for the WMA and
+ * MP3 decoders, which is what the x86-64 Linux and Windows configs and both
+ * Android configs say. The macOS configs were generated for another selection:
+ * network and the WAV demuxer on, ASF, MP3 and WMA off. libavformat then failed
+ * to link on a Mac (ff_network_init, ff_tls_init, ff_wav_demuxer) and would
+ * have had no demuxer for the songs. Every other platform gets the vendored
+ * config untouched. */
+#include "@FFMPEG_DIR@/config.h"
+
+#if defined(__APPLE__)
+
+#undef CONFIG_NETWORK
+#define CONFIG_NETWORK 0
+#undef CONFIG_WAV_DEMUXER
+#define CONFIG_WAV_DEMUXER 0
+
+#undef CONFIG_ASF_DEMUXER
+#define CONFIG_ASF_DEMUXER 1
+#undef CONFIG_MP3_DEMUXER
+#define CONFIG_MP3_DEMUXER 1
+#undef CONFIG_WMAV2_DECODER
+#define CONFIG_WMAV2_DECODER 1
+#undef CONFIG_MP3_DECODER
+#define CONFIG_MP3_DECODER 1
+#undef CONFIG_MP3FLOAT_DECODER
+#define CONFIG_MP3FLOAT_DECODER 1
+
+#undef CONFIG_PARSERS
+#define CONFIG_PARSERS 1
+#undef CONFIG_MPEGAUDIO_PARSER
+#define CONFIG_MPEGAUDIO_PARSER 1
+#undef CONFIG_MPEGAUDIO
+#define CONFIG_MPEGAUDIO 1
+#undef CONFIG_MPEGAUDIODSP
+#define CONFIG_MPEGAUDIODSP 1
+#undef CONFIG_MPEGAUDIOHEADER
+#define CONFIG_MPEGAUDIOHEADER 1
+#undef CONFIG_DCT
+#define CONFIG_DCT 1
+#undef CONFIG_RDFT
+#define CONFIG_RDFT 1
+
+#endif
