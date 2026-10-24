@@ -182,6 +182,13 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // Saves brought from elsewhere, taken in once (at the title's first look at
+  // its content): an Xbox 360 save package (STFS, "CON") of this title put in
+  // root_path_/import/ is unpacked into this profile, and a save folder of
+  // this title under another profile's XUID (Xenia keeps one per profile) is
+  // copied in where this profile has none of that name.
+  void ImportSaves(uint64_t xuid);
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -198,6 +205,7 @@ class ContentManager {
 
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  bool imported_ = false;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

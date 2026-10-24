@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 
 #include <rex/filesystem.h>
+#include <rex/logging.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
@@ -145,6 +146,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     title_id = kernel_state_->title_id();
   }
 
+  if (content_type == XContentType::kSavedGame && xuid != 0) {
+    ImportSaves(xuid);
+  }
+
   // Search path:
   // content_root/xuid/title_id/type_name/*
   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
@@ -175,6 +180,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
 
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (data.content_type == XContentType::kSavedGame && xuid != 0) {
+    ImportSaves(xuid);
+  }
   auto package_path = ResolvePackagePath(xuid, data);
   if (!std::filesystem::exists(package_path)) {
     return nullptr;
@@ -643,6 +651,118 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
 
   // Write .header file
   return WriteContentHeaderFile(0, content_data, license_mask);
+}
+
+void ContentManager::ImportSaves(uint64_t xuid) {
+  if (imported_) {
+    return;
+  }
+  imported_ = true;
+  const uint32_t title_id = kernel_state_->title_id();
+  const auto saves = ResolvePackageRoot(xuid, XContentType::kSavedGame, title_id);
+  std::error_code ec;
+
+  // Save packages from a console (or a site that keeps them as they are).
+  const auto import_dir = root_path_ / "import";
+  if (std::filesystem::is_directory(import_dir, ec)) {
+    for (const auto& item : std::filesystem::directory_iterator(import_dir, ec)) {
+      if (!item.is_regular_file(ec)) {
+        continue;
+      }
+      const auto package_path = item.path();
+      auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
+      if (!device->Initialize()) {
+        REXLOG_WARN("saves: import/{} is not an Xbox 360 package", rex::path_to_utf8(package_path.filename()));
+        continue;
+      }
+      const auto& metadata = device->header().metadata;
+      if (uint32_t(metadata.execution_info.title_id) != title_id ||
+          metadata.content_type != XContentType::kSavedGame) {
+        REXLOG_WARN("saves: import/{} is not a save of this game (title {:08X}, type {:08X})",
+                    rex::path_to_utf8(package_path.filename()), uint32_t(metadata.execution_info.title_id),
+                    uint32_t(XContentType(metadata.content_type)));
+        continue;
+      }
+      // Its name on the console's drive is the save's: "Player Files" and the
+      // like. A file renamed on the way (a .con, a .bin) loses the extension.
+      auto name = package_path.filename();
+      if (name.has_extension()) {
+        name = name.stem();
+      }
+      XCONTENT_AGGREGATE_DATA data;
+      data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+      data.content_type = XContentType::kSavedGame;
+      data.title_id = title_id;
+      data.xuid = xuid;
+      data.set_file_name(rex::path_to_utf8(name));
+      const auto display_name = metadata.display_name(rex::system::XLanguage::kEnglish);
+      data.set_display_name(display_name.empty() ? rex::path_to_utf16(name) : display_name);
+      const auto install_path = saves / name;
+      // A save of that name already here is kept beside it, not lost.
+      if (std::filesystem::exists(install_path, ec)) {
+        auto backup = install_path;
+        backup += ".before-import";
+        std::filesystem::remove_all(backup, ec);
+        std::filesystem::rename(install_path, backup, ec);
+      }
+      std::filesystem::create_directories(install_path, ec);
+      auto* root = device->ResolvePath("");
+      bool ok = root != nullptr && !ec;
+      std::queue<rex::filesystem::Entry*> queue;
+      if (ok) {
+        queue.push(root);
+      }
+      while (ok && !queue.empty()) {
+        auto* entry = queue.front();
+        queue.pop();
+        for (auto& child : entry->children()) {
+          queue.push(child.get());
+        }
+        ok = ExtractEntry(entry, install_path) == X_ERROR_SUCCESS;
+      }
+      device.reset();
+      if (!ok || WriteContentHeaderFile(xuid, data, 0) != X_ERROR_SUCCESS) {
+        REXLOG_WARN("saves: import/{} could not be unpacked", rex::path_to_utf8(package_path.filename()));
+        continue;
+      }
+      // Done with: moved aside, so it is not taken in again at the next start.
+      std::filesystem::create_directories(import_dir / "imported", ec);
+      std::filesystem::rename(package_path, import_dir / "imported" / package_path.filename(), ec);
+      REXLOG_INFO("saves: import/{} unpacked as \"{}\"", rex::path_to_utf8(package_path.filename()),
+                  rex::path_to_utf8(name));
+    }
+  }
+
+  // Xenia's saves, under the XUID of the profile they were made with.
+  const auto title_str = fmt::format("{:08X}", title_id);
+  const auto own_str = fmt::format("{:016X}", xuid);
+  for (const auto& profile : std::filesystem::directory_iterator(root_path_, ec)) {
+    const auto profile_name = rex::path_to_utf8(profile.path().filename());
+    if (!profile.is_directory(ec) || profile_name.size() != 16 || profile_name == own_str ||
+        profile_name == "0000000000000000" ||
+        profile_name.find_first_not_of("0123456789ABCDEFabcdef") != std::string::npos) {
+      continue;
+    }
+    const auto theirs = profile.path() / title_str / "00000001";
+    if (!std::filesystem::is_directory(theirs, ec)) {
+      continue;
+    }
+    for (const auto& save : std::filesystem::directory_iterator(theirs, ec)) {
+      const auto name = save.path().filename();
+      if (!save.is_directory(ec) || std::filesystem::exists(saves / name, ec)) {
+        continue;
+      }
+      std::filesystem::create_directories(saves, ec);
+      std::filesystem::copy(save.path(), saves / name, std::filesystem::copy_options::recursive, ec);
+      if (ec) {
+        REXLOG_WARN("saves: {}'s \"{}\" could not be copied: {}", profile_name, rex::path_to_utf8(name),
+                    ec.message());
+        ec.clear();
+        continue;
+      }
+      REXLOG_INFO("saves: \"{}\" taken from profile {}", rex::path_to_utf8(name), profile_name);
+    }
+  }
 }
 
 }  // namespace xam
