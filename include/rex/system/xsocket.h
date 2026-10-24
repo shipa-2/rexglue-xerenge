@@ -136,6 +136,10 @@ class XSocket : public XObject {
   // that talks to their sender (see xsocket.cpp).
   struct PortGroup;
 
+  // The lobby server the title is logged in to (as on the wire), for the NAT
+  // traversal (xsocket.cpp); one on the player's own network turns it off.
+  static void SetNatServer(uint32_t address_be);
+
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
   uint64_t native_handle_ = -1;

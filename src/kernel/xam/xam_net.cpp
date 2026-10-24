@@ -1534,6 +1534,9 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     REXKRNL_INFO("--online wire: bind socket {:08X} to {}.{}.{}.{}:{}", socket_handle, ip >> 24,
                  (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, uint16_t(native_name.sin_port));
   }
+  if (OnlineStub()) {
+    XSocket::SetNatServer(OnlineServiceAddress());
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     REXKRNL_WARN("--online wire: bind socket {:08X} FAILED, errno {}", socket_handle, errno);

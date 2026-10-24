@@ -10,11 +10,14 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <rex/kernel/xam/module.h>
@@ -89,7 +92,171 @@ uint64_t PortKey(uint32_t address_be, uint16_t port_be) {
   return (uint64_t(ntohl(address_be)) << 16) | ntohs(port_be);
 }
 
+// NAT traversal (Xerenge #49). Players on the internet are behind routers
+// that let a UDP packet in only from where one of their own went out to, and
+// on a port of the router's choosing: the title, which sends to the address
+// the lobby gave and to its fixed ports, reaches no one. So each of its UDP
+// sockets registers with the lobby server on the directory port ("XNAT1 REG
+// <port>", renewed every 20 s), the server noting where the router mapped it.
+// A packet to another player's address first asks the server for that
+// player's socket ("XNAT1 ASK"); the answer ("ANS") and the server's word to
+// the other player ("MEET") make both sides send to each other's mapping, which
+// opens both routers. From then on what the title sends there goes to the
+// mapping, and what comes from the mapping comes to the title as from the
+// address and port it knows. Off for a lobby on the player's own network.
+namespace nat {
+
+constexpr char kPrefix[] = "XNAT1 ";
+constexpr uint16_t kServerPort = 31860;  // the lobby's directory port
+
+std::mutex g_mutex;
+uint32_t g_server = 0;  // the lobby server, as on the wire; 0: off
+struct Mapping {
+  uint32_t address = 0;  // as on the wire
+  uint16_t port = 0;     // as on the wire
+};
+std::map<uint64_t, Mapping> g_out;      // by the address and port the title sends to
+std::map<uint64_t, uint64_t> g_back;    // the mapping -> what the title knows it as
+std::map<uint64_t, std::chrono::steady_clock::time_point> g_asked;
+std::map<uint64_t, uint16_t> g_sockets;  // native socket -> its port (as on the wire)
+bool g_keepalive = false;
+
+bool IsLocal(uint32_t address_be) {
+  const uint32_t a = ntohl(address_be);
+  const uint32_t top = a >> 24, second = (a >> 16) & 0xFF;
+  return top == 10 || top == 127 || top == 0 || top >= 224 || (top == 172 && second >= 16 && second < 32) ||
+         (top == 192 && second == 168) || (top == 169 && second == 254) ||
+         (top == 100 && second >= 64 && second < 128);
+}
+
+std::string Dotted(uint32_t address_be) {
+  char text[INET_ADDRSTRLEN] = {};
+  in_addr in = {};
+  in.s_addr = address_be;
+  inet_ntop(AF_INET, &in, text, sizeof(text));
+  return text;
+}
+
+void SendText(uint64_t fd, const std::string& text, uint32_t address_be, uint16_t port_be) {
+  sockaddr_in to = {};
+  to.sin_family = AF_INET;
+  to.sin_addr.s_addr = address_be;
+  to.sin_port = port_be;
+#if REX_PLATFORM_WIN32
+  sendto(SOCKET(fd), text.data(), int(text.size()), 0, (sockaddr*)&to, sizeof(to));
+#else
+  sendto(int(fd), text.data(), text.size(), 0, (sockaddr*)&to, sizeof(to));
+#endif
+}
+
+// Called with g_mutex held.
+void Register(uint64_t fd, uint16_t port_be) {
+  SendText(fd, std::string(kPrefix) + "REG " + std::to_string(ntohs(port_be)), g_server, htons(kServerPort));
+}
+
+void Add(uint64_t fd, uint16_t port_be) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_server || port_be == 0) {
+    return;
+  }
+  g_sockets[fd] = port_be;
+  Register(fd, port_be);
+  if (!g_keepalive) {
+    g_keepalive = true;
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const auto& [fd, port] : g_sockets) {
+          Register(fd, port);
+        }
+      }
+    }).detach();
+  }
+}
+
+void Forget(uint64_t fd) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_sockets.erase(fd);
+}
+
+// Where a datagram to `to` goes (rewritten in place); asks the server once a
+// second while the other player's mapping is not known.
+void Outgoing(uint64_t fd, sockaddr_in* to) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_server || to->sin_addr.s_addr == g_server || IsLocal(to->sin_addr.s_addr)) {
+    return;
+  }
+  const uint64_t key = PortKey(to->sin_addr.s_addr, to->sin_port);
+  if (auto found = g_out.find(key); found != g_out.end()) {
+    to->sin_addr.s_addr = found->second.address;
+    to->sin_port = found->second.port;
+    return;
+  }
+  const auto socket = g_sockets.find(fd);
+  if (socket == g_sockets.end()) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  auto& asked = g_asked[key];
+  if (now - asked < std::chrono::seconds(1)) {
+    return;
+  }
+  asked = now;
+  SendText(fd,
+           std::string(kPrefix) + "ASK " + std::to_string(ntohs(socket->second)) + " " +
+               Dotted(to->sin_addr.s_addr) + " " + std::to_string(ntohs(to->sin_port)),
+           g_server, htons(kServerPort));
+}
+
+// True for this traversal's own datagrams, which the title never sees; a
+// datagram from a mapping comes as from the address the title knows.
+bool Incoming(uint64_t fd, const uint8_t* data, size_t length, sockaddr_in* from) {
+  const size_t prefix = sizeof(kPrefix) - 1;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_server) {
+    return false;
+  }
+  if (length > prefix && std::memcmp(data, kPrefix, prefix) == 0) {
+    char text[128] = {};
+    std::memcpy(text, data + prefix, std::min(length - prefix, sizeof(text) - 1));
+    char verb[8] = {}, known[INET_ADDRSTRLEN] = {}, mapped[INET_ADDRSTRLEN] = {};
+    unsigned known_port = 0, mapped_port = 0;
+    in_addr known_address = {}, mapped_address = {};
+    if (from->sin_addr.s_addr == g_server &&
+        std::sscanf(text, "%7s %15s %u %15s %u", verb, known, &known_port, mapped, &mapped_port) == 5 &&
+        (!std::strcmp(verb, "ANS") || !std::strcmp(verb, "MEET")) && known_port && known_port <= 0xFFFF &&
+        mapped_port && mapped_port <= 0xFFFF && inet_pton(AF_INET, known, &known_address) == 1 &&
+        inet_pton(AF_INET, mapped, &mapped_address) == 1) {
+      const uint64_t key = PortKey(known_address.s_addr, htons(uint16_t(known_port)));
+      const Mapping mapping{mapped_address.s_addr, htons(uint16_t(mapped_port))};
+      if (g_out.find(key) == g_out.end()) {
+        REXKRNL_INFO("--online: NAT - {}:{} is reached at {}:{} ({})", known, known_port, mapped, mapped_port,
+                     verb);
+      }
+      g_out[key] = mapping;
+      g_back[PortKey(mapping.address, mapping.port)] = key;
+      for (int i = 0; i < 2; ++i) {
+        SendText(fd, std::string(kPrefix) + "HI", mapping.address, mapping.port);
+      }
+    }
+    return true;
+  }
+  if (auto found = g_back.find(PortKey(from->sin_addr.s_addr, from->sin_port)); found != g_back.end()) {
+    from->sin_addr.s_addr = htonl(uint32_t(found->second >> 16));
+    from->sin_port = htons(uint16_t(found->second & 0xFFFF));
+  }
+  return false;
+}
+
+}  // namespace nat
+
 }  // namespace
+
+void XSocket::SetNatServer(uint32_t address_be) {
+  std::lock_guard<std::mutex> lock(nat::g_mutex);
+  nat::g_server = nat::IsLocal(address_be) ? 0 : address_be;
+}
 
 std::shared_ptr<XSocket::PortGroup> XSocket::Shared() {
   if (group_ || share_key_ == 0 || bound_) {
@@ -154,6 +321,7 @@ X_STATUS XSocket::Close() {
       g_port_groups.erase(group->key);
     } else if (members.empty() && group->fd != uint64_t(-1)) {
       g_port_groups.erase(group->key);
+      nat::Forget(group->fd);
       rex::net::socket_close(group->fd);
     }
   }
@@ -161,6 +329,7 @@ X_STATUS XSocket::Close() {
     return X_STATUS_SUCCESS;
   }
 
+  nat::Forget(native_handle_);
   int ret = rex::net::socket_close(native_handle_);
   native_handle_ = -1;
   if (ret != 0) {
@@ -287,6 +456,13 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
     g_port_groups[key] = group;
     group_ = group;
   }
+  if (type_ == X_SOCK_DGRAM) {
+    sockaddr_in got = {};
+    socklen_t got_length = sizeof(got);
+    if (getsockname(native_handle_, (sockaddr*)&got, &got_length) == 0) {
+      nat::Add(native_handle_, got.sin_port);
+    }
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -383,6 +559,9 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
         break;
       }
       datagram.data.resize(size_t(got));
+      if (nat::Incoming(group->fd, datagram.data.data(), datagram.data.size(), &datagram.from)) {
+        continue;
+      }
       const uint64_t sender = PortKey(datagram.from.sin_addr.s_addr, datagram.from.sin_port);
       PortGroup::Member* to = nullptr;
       for (auto& member : group->members) {
@@ -417,8 +596,10 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
     std::memcpy(buf, datagram.data.data(), size_t(ret));
     nfrom = datagram.from;
   } else {
-    ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                   (sockaddr*)&nfrom, &nfromlen);
+    do {
+      nfromlen = sizeof(sockaddr_in);
+      ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags, (sockaddr*)&nfrom, &nfromlen);
+    } while (ret > 0 && nat::Incoming(native_handle_, buf, size_t(ret), &nfrom));
   }
   if (from) {
     from->sin_family = nfrom.sin_family;
@@ -470,6 +651,9 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
         self->peers.insert(PortKey(nto.sin_addr.s_addr, nto.sin_port));
       }
     }
+  }
+  if (to) {
+    nat::Outgoing(fd, &nto);
   }
   return sendto(fd, reinterpret_cast<char*>(buf), buf_len, flags,
                 to ? (sockaddr*)&nto : nullptr, to_len);
