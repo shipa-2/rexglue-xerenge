@@ -197,6 +197,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                     results_buffer_size, search_results_ptr);
+      // Ranked's TrueSkill matchmaking: there is no Xbox Live to search, so no
+      // sessions - XSESSION_SEARCHRESULT_HEADER, count and results, cleared (the
+      // buffer may hold an earlier search). The lobby's quick match finds the
+      // games instead (as secretpray/burnout-revenge 44688ff found).
+      if (search_results_ptr && results_buffer_size >= 8) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(search_results_ptr), 0);
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(search_results_ptr + 4), 0);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
