@@ -873,7 +873,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       static_assert_size(decltype(*args), 8);
 
       assert_true(args->xmp_client == 0x00000002);
-      REXKRNL_INFO("XMP: title sets the volume to {:g}", float(args->value));
+      REXKRNL_DEBUG("XMP: title sets the volume to {:g}", float(args->value));
       volume_ = args->value;
       return X_E_SUCCESS;
     }
