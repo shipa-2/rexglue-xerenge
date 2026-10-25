@@ -154,6 +154,10 @@ class XmpApp : public system::xam::App {
   // title that recreates its playlist handle every frame while previewing a
   // track does not restart decode when the underlying file did not change.
   std::string active_file_path_;
+  // Where it was read from (the song path resolver's answer): the same
+  // title path can be another file once the resolver answers otherwise.
+  std::string active_read_path_;
+  std::string ActiveReadPath();
 
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;

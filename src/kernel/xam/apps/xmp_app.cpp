@@ -28,6 +28,7 @@
 #include <span>
 
 #include <rex/audio/audio_driver.h>
+#include <rex/kernel/xam/xmp.h>
 #include <rex/audio/audio_system.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -51,6 +52,27 @@ REXCVAR_DEFINE_BOOL(xmp_enable, true, "Audio",
 namespace rex {
 namespace kernel {
 namespace xam {
+
+namespace {
+std::mutex g_song_path_mutex;
+std::function<std::string(const std::string&)> g_song_path_resolver;
+}  // namespace
+
+void SetXmpSongPathResolver(std::function<std::string(const std::string&)> resolver) {
+  std::lock_guard<std::mutex> lock(g_song_path_mutex);
+  g_song_path_resolver = std::move(resolver);
+}
+
+namespace {
+std::string ResolveSongPath(const std::string& path) {
+  std::function<std::string(const std::string&)> resolver;
+  {
+    std::lock_guard<std::mutex> lock(g_song_path_mutex);
+    resolver = g_song_path_resolver;
+  }
+  return resolver ? resolver(path) : path;
+}
+}  // namespace
 using namespace rex::system;
 using namespace rex::system::xam;
 namespace apps {
@@ -248,10 +270,14 @@ bool XmpApp::PlayFile(const std::string& utf8_path, Playlist* playlist, int song
            active_file_path_ != utf8_path;
   };
 
+  const std::string read_path = ResolveSongPath(utf8_path);
+  if (read_path != utf8_path) {
+    REXKRNL_INFO("XMP: {} read from {}", utf8_path, read_path);
+  }
   rex::filesystem::File* vfs_file = nullptr;
   rex::filesystem::FileAction action;
   X_STATUS open_status = kernel_state_->file_system()->OpenFile(
-      nullptr, utf8_path, rex::filesystem::FileDisposition::kOpen,
+      nullptr, read_path, rex::filesystem::FileDisposition::kOpen,
       rex::filesystem::FileAccess::kGenericRead, false, true, &vfs_file, &action);
   if (XFAILED(open_status)) {
     REXKRNL_ERROR("XMP: opening {} failed with status {:08X}", utf8_path, open_status);
@@ -479,6 +505,11 @@ void XmpApp::WorkerThreadMain() {
     int song_index = active_song_index_;
     auto utf8_path = rex::string::to_utf8(playlist->songs[song_index]->file_path);
     active_file_path_ = utf8_path;
+    {
+      const std::string read_path = ResolveSongPath(utf8_path);
+      std::lock_guard<std::mutex> lock(g_song_path_mutex);
+      active_read_path_ = read_path;
+    }
     active_song_handle_ = playlist->songs[song_index]->handle;
     REXKRNL_INFO("XMP: playing [{}] {}", song_index, utf8_path);
 
@@ -609,6 +640,11 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
   return X_E_SUCCESS;
 }
 
+std::string XmpApp::ActiveReadPath() {
+  std::lock_guard<std::mutex> lock(g_song_path_mutex);
+  return active_read_path_;
+}
+
 X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
   REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
   Playlist* playlist = nullptr;
@@ -638,7 +674,7 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
   }
   const auto target_path = rex::string::to_utf8(playlist->songs[target_index]->file_path);
   if (state_ == State::kPlaying && target_index == active_song_index_ &&
-      target_path == active_file_path_) {
+      target_path == active_file_path_ && ResolveSongPath(target_path) == ActiveReadPath()) {
     // Nothing changes, so nothing is announced. Every one of these calls used
     // to queue a state-change and a behaviour-change notification; the title
     // takes one notification a frame off its listener, so the queue only ever
