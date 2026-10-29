@@ -190,6 +190,13 @@ class IGraphicsSystem {
     // ... with its box against the screen's left edge rather than centred
     // (the music player's panel).
     bool interface_left = false;
+    // ... or across the whole screen, neither boxed nor moved: an overlay the
+    // title draws over all of its 16:9 screen (the crash border, a flash).
+    bool interface_fill = false;
+    // Where the element the draw belongs to goes, decided by the title's own
+    // layout of it: 0 not decided (the renderer looks at the draws), 1 the
+    // left edge, 2 the middle, 3 the right edge.
+    uint8_t interface_edge = 0;
     // Which of the title's 2D objects the draw belongs to (0: none): the draws
     // of one object - a panel and its text - move to the same edge together.
     uint32_t interface_object = 0;
