@@ -163,6 +163,13 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data{};
     if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
                               content_data) == X_ERROR_SUCCESS) {
+      // A header copied in with the save - from Xenia, from another profile -
+      // may name another profile or another folder; the package is the one
+      // found here, and opening it by the header's would miss it (GitHub #46).
+      content_data.xuid = xuid;
+      content_data.title_id = title_id;
+      content_data.content_type = content_type;
+      content_data.set_file_name(rex::path_to_utf8(file_info.name));
       result.emplace_back(std::move(content_data));
     } else {
       content_data.device_id = device_id;
