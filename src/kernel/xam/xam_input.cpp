@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include <rex/kernel/xam/pad.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -336,6 +337,15 @@ void StampReplayPacketNumber(input::X_INPUT_STATE* state) {
 }  // namespace
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
+PadFilter& ThePadFilter() {
+  static PadFilter filter;
+  return filter;
+}
+
+void SetPadFilter(PadFilter filter) {
+  ThePadFilter() = std::move(filter);
+}
+
 u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
   // Games call this with a NULL state ptr, probably as a query.
   static int call_count = 0;
@@ -357,6 +367,15 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
 
   auto* is = input_system();
   const u32 result = is->GetState(actual_user_index, input_state);
+  if (result == X_ERROR_SUCCESS && input_state && ThePadFilter()) {
+    uint16_t buttons = uint16_t(input_state->gamepad.buttons);
+    uint8_t left = uint8_t(input_state->gamepad.left_trigger);
+    uint8_t right = uint8_t(input_state->gamepad.right_trigger);
+    ThePadFilter()(actual_user_index, buttons, left, right);
+    input_state->gamepad.buttons = buttons;
+    input_state->gamepad.left_trigger = left;
+    input_state->gamepad.right_trigger = right;
+  }
   if (result == X_ERROR_SUCCESS && input_state) {
     const uint64_t poll = PadPollIndex();
     // Live input takes over whenever there is any. A replay that cannot be
