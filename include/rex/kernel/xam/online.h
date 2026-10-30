@@ -25,6 +25,12 @@ uint32_t OnlineServiceAddress();
 // LAN.
 uint32_t OnlineLocalAddress();
 
+// From the lobby server's record of a game: a player at `local_be` on its own
+// network is at `public_be` on the internet (both network byte order).
+// XNetXnAddrToInAddr then gives the title the latter for a peer whose XNADDR
+// names the former, so its datagrams go where they can arrive.
+void NoteLobbyAddress(uint32_t local_be, uint32_t public_be);
+
 // --online: an XSESSION_INFO for a session this console creates as its host,
 // written at `info` (60 bytes: XNKID, the host's XNADDR, XNKEY) and a nonce at
 // `nonce` (8 bytes) - either may be null. False when not online.

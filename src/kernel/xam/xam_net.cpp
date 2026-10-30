@@ -98,6 +98,11 @@ bool OnlineStub() {
 
 namespace {
 std::mutex g_online_mutex;
+// A player's address on the internet, by the one on its own network, as the
+// lobby server gives both (NoteLobbyAddress). A peer's XNADDR carries only the
+// latter - all it knows of itself - and a player behind another router is not
+// there (GitHub #67).
+std::map<uint32_t, uint32_t> g_public_of;
 // A function-local static: the title's side may register its provider from its
 // own static initialisers, which can run before this file's.
 std::function<uint32_t()>& ServiceAddressProvider() {
@@ -105,6 +110,18 @@ std::function<uint32_t()>& ServiceAddressProvider() {
   return provider;
 }
 }  // namespace
+
+void NoteLobbyAddress(uint32_t local_be, uint32_t public_be) {
+  std::lock_guard lock(g_online_mutex);
+  auto& known = g_public_of[local_be];
+  if (known != public_be) {
+    known = public_be;
+    char from[INET_ADDRSTRLEN] = "?", to[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &local_be, from, sizeof(from));
+    inet_ntop(AF_INET, &public_be, to, sizeof(to));
+    REXKRNL_INFO("--online: a player at {} on its own network is {} on the internet", from, to);
+  }
+}
 
 void SetOnlineServiceAddressProvider(std::function<uint32_t()> provider) {
   std::lock_guard lock(g_online_mutex);
@@ -908,6 +925,9 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
     }
     {
       std::lock_guard lock(g_online_mutex);
+      if (const auto pub = g_public_of.find(address); pub != g_public_of.end()) {
+        address = pub->second;
+      }
       std::array<uint8_t, 36> copy;
       std::memcpy(copy.data(), static_cast<XNADDR*>(xn_addr), sizeof(XNADDR));
       g_known_xnaddrs[address] = copy;
