@@ -146,8 +146,11 @@ uint32_t OnlineServiceAddress() {
   return address ? address : htonl(INADDR_LOOPBACK);
 }
 
-uint32_t OnlineLocalAddress() {
-  static const uint32_t address = [] {
+namespace {
+
+// The address this console has now (OnlineLocalAddress keeps it).
+uint32_t FindLocalAddress() {
+  const uint32_t address = [] {
     const std::string configured = REXCVAR_GET(online_address);
     if (!configured.empty()) {
       in_addr parsed{};
@@ -191,9 +194,6 @@ uint32_t OnlineLocalAddress() {
         freeifaddrs(interfaces);
       }
       if (best) {
-        char text[INET_ADDRSTRLEN] = "?";
-        inet_ntop(AF_INET, &best, text, sizeof(text));
-        REXKRNL_INFO("--online: this console's address is {}", text);
         return best;
       }
     }
@@ -227,11 +227,32 @@ uint32_t OnlineLocalAddress() {
 #else
     ::close(probe);
 #endif
-    char text[INET_ADDRSTRLEN] = "?";
-    inet_ntop(AF_INET, &found, text, sizeof(text));
-    REXKRNL_INFO("--online: this console's address is {}", text);
     return found;
   }();
+  return address;
+}
+
+}  // namespace
+
+// Looked at again every few seconds, not once a run: a phone that went from its
+// Wi-Fi to the mobile network kept giving its peers - and the lobby server -
+// the address it had at the start, which no one could reach.
+uint32_t OnlineLocalAddress() {
+  static std::mutex mutex;
+  static uint32_t address = 0;
+  static std::chrono::steady_clock::time_point checked{};
+  std::lock_guard lock(mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (address == 0 || now - checked > std::chrono::seconds(2)) {
+    checked = now;
+    const uint32_t found = FindLocalAddress();
+    if (found != address) {
+      char text[INET_ADDRSTRLEN] = "?";
+      inet_ntop(AF_INET, &found, text, sizeof(text));
+      REXKRNL_INFO("--online: this console's address is {}{}", text, address ? " now" : "");
+      address = found;
+    }
+  }
   return address;
 }
 
