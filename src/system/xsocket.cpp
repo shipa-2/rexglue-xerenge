@@ -209,6 +209,58 @@ void Outgoing(uint64_t fd, sockaddr_in* to) {
            g_server, htons(kServerPort));
 }
 
+// Players on this console's own network whose way to the internet is another
+// (a VPN on one of the two): their address on the internet -> their address here.
+std::map<uint32_t, uint32_t> g_neighbours;
+// The mappings learnt from a player's own datagrams (Learn): the server's word
+// for them (ANS, MEET), which may come after, no longer replaces them.
+std::set<uint64_t> g_seen;
+
+// Where a player really is for this socket, from a datagram of theirs. A
+// player's router that gives each destination a port of its own (a VPN's exit,
+// a carrier's NAT) sends from a port other than the one the server saw, and
+// datagrams sent there were lost - the game session on 8192 never came up,
+// though 6000 did, answered where it came from. A datagram from a player we
+// know - from their address on the internet, or from their address here when
+// they are on this network too - on this socket's port says where they are for
+// it: sent there from now on (as ICE's peer-reflexive addresses). The title
+// knows them by their address on the internet. Called with g_mutex held.
+void Learn(uint64_t fd, const sockaddr_in& from) {
+  if (g_back.count(PortKey(from.sin_addr.s_addr, from.sin_port))) {
+    return;
+  }
+  const auto socket = g_sockets.find(fd);
+  if (socket == g_sockets.end()) {
+    return;
+  }
+  uint32_t player = 0;
+  for (const auto& [on_internet, here] : g_neighbours) {
+    if (here == from.sin_addr.s_addr) {
+      player = on_internet;
+    }
+  }
+  if (!player && !IsLocal(from.sin_addr.s_addr)) {
+    for (const auto& [key, mapping] : g_out) {
+      if (mapping.address == from.sin_addr.s_addr) {
+        player = from.sin_addr.s_addr;
+      }
+    }
+  }
+  if (!player) {
+    return;
+  }
+  const uint64_t key = PortKey(player, socket->second);
+  const Mapping seen{from.sin_addr.s_addr, from.sin_port};
+  if (auto out = g_out.find(key); out == g_out.end() || out->second.port != seen.port ||
+                                  out->second.address != seen.address) {
+    REXKRNL_INFO("--online: NAT - {}:{} is reached at {}:{} (seen)", Dotted(player), ntohs(socket->second),
+                 Dotted(seen.address), ntohs(seen.port));
+    g_out[key] = seen;
+  }
+  g_seen.insert(key);
+  g_back[PortKey(seen.address, seen.port)] = key;
+}
+
 // True for this traversal's own datagrams, which the title never sees; a
 // datagram from a mapping comes as from the address the title knows.
 bool Incoming(uint64_t fd, const uint8_t* data, size_t length, sockaddr_in* from) {
@@ -234,41 +286,27 @@ bool Incoming(uint64_t fd, const uint8_t* data, size_t length, sockaddr_in* from
         REXKRNL_INFO("--online: NAT - {}:{} is reached at {}:{} ({})", known, known_port, mapped, mapped_port,
                      verb);
       }
-      g_out[key] = mapping;
-      g_back[PortKey(mapping.address, mapping.port)] = key;
+      if (!g_seen.count(key)) {
+        g_out[key] = mapping;
+        g_back[PortKey(mapping.address, mapping.port)] = key;
+      }
       for (int i = 0; i < 2; ++i) {
         SendText(fd, std::string(kPrefix) + "HI", mapping.address, mapping.port);
+        // ... and to the player's address here, when on this network too.
+        if (auto here = g_neighbours.find(known_address.s_addr); here != g_neighbours.end()) {
+          SendText(fd, std::string(kPrefix) + "HI", here->second, htons(uint16_t(known_port)));
+        }
       }
+    }
+    // A player's HI: where they are for this socket (the game's own first
+    // datagram may not come before ours have reached them).
+    if (from->sin_addr.s_addr != g_server) {
+      Learn(fd, *from);
     }
     return true;
   }
+  Learn(fd, *from);
   auto found = g_back.find(PortKey(from->sin_addr.s_addr, from->sin_port));
-  if (found == g_back.end() && !IsLocal(from->sin_addr.s_addr)) {
-    // A player's router that gives each destination a port of its own (a VPN's
-    // exit, a carrier's NAT): its datagrams to us come from a port other than
-    // the one the server saw, and ours sent there were lost - the game session
-    // on 8192 never came up, though 6000 did, answered where it came from. A
-    // datagram from a player we know, on this socket's port, says where that
-    // player really is for it: sent there from now on (as ICE's
-    // peer-reflexive addresses).
-    const auto socket = g_sockets.find(fd);
-    if (socket != g_sockets.end()) {
-      bool known = false;
-      for (const auto& [key, mapping] : g_out) {
-        known = known || mapping.address == from->sin_addr.s_addr;
-      }
-      if (known) {
-        const uint64_t key = PortKey(from->sin_addr.s_addr, socket->second);
-        const Mapping seen{from->sin_addr.s_addr, from->sin_port};
-        if (auto out = g_out.find(key); out == g_out.end() || out->second.port != seen.port) {
-          REXKRNL_INFO("--online: NAT - {}:{} is reached at {}:{} (seen)", Dotted(from->sin_addr.s_addr),
-                       ntohs(socket->second), Dotted(seen.address), ntohs(seen.port));
-          g_out[key] = seen;
-        }
-        found = g_back.insert_or_assign(PortKey(seen.address, seen.port), key).first;
-      }
-    }
-  }
   if (found != g_back.end()) {
     from->sin_addr.s_addr = htonl(uint32_t(found->second >> 16));
     from->sin_port = htons(uint16_t(found->second & 0xFFFF));
@@ -276,9 +314,32 @@ bool Incoming(uint64_t fd, const uint8_t* data, size_t length, sockaddr_in* from
   return false;
 }
 
+// A copy of a datagram to a player on this network too, at their address here,
+// until one of theirs has come from there (and the title's sends go there by
+// themselves). `to` as the title gave it, before Outgoing.
+bool NeighbourCopy(const sockaddr_in& to, sockaddr_in* copy) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const auto here = g_neighbours.find(to.sin_addr.s_addr);
+  if (!g_server || here == g_neighbours.end()) {
+    return false;
+  }
+  if (auto out = g_out.find(PortKey(to.sin_addr.s_addr, to.sin_port));
+      out != g_out.end() && out->second.address == here->second) {
+    return false;
+  }
+  *copy = to;
+  copy->sin_addr.s_addr = here->second;
+  return true;
+}
+
 }  // namespace nat
 
 }  // namespace
+
+void XSocket::SetNatNeighbour(uint32_t public_be, uint32_t local_be) {
+  std::lock_guard<std::mutex> lock(nat::g_mutex);
+  nat::g_neighbours[public_be] = local_be;
+}
 
 void XSocket::SetNatServer(uint32_t address_be) {
   std::lock_guard<std::mutex> lock(nat::g_mutex);
@@ -679,11 +740,17 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
       }
     }
   }
+  sockaddr_in here = {};
+  const bool to_here_too = to && nat::NeighbourCopy(nto, &here);
   if (to) {
     nat::Outgoing(fd, &nto);
   }
-  return sendto(fd, reinterpret_cast<char*>(buf), buf_len, flags,
-                to ? (sockaddr*)&nto : nullptr, to_len);
+  const int sent = sendto(fd, reinterpret_cast<char*>(buf), buf_len, flags,
+                          to ? (sockaddr*)&nto : nullptr, to_len);
+  if (to_here_too) {
+    sendto(fd, reinterpret_cast<char*>(buf), buf_len, flags, (sockaddr*)&here, sizeof(here));
+  }
+  return sent;
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {

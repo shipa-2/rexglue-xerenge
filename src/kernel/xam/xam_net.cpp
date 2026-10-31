@@ -120,6 +120,14 @@ void NoteLobbyAddress(uint32_t local_be, uint32_t public_be) {
     inet_ntop(AF_INET, &local_be, from, sizeof(from));
     inet_ntop(AF_INET, &public_be, to, sizeof(to));
     REXKRNL_INFO("--online: a player at {} on its own network is {} on the internet", from, to);
+    // On this console's own network too (the same /24): it may be reached there
+    // - the lobby server saw two networks, one of the two going out through a
+    // VPN, and neither could reach the other's address on the internet.
+    const uint32_t own = OnlineLocalAddress();
+    if ((ntohl(own) & 0xFFFFFF00u) == (ntohl(local_be) & 0xFFFFFF00u) && own != local_be) {
+      REXKRNL_INFO("--online: {} is on this network too - tried there as well", from);
+      XSocket::SetNatNeighbour(public_be, local_be);
+    }
   }
 }
 

@@ -139,6 +139,10 @@ class XSocket : public XObject {
   // The lobby server the title is logged in to (as on the wire), for the NAT
   // traversal (xsocket.cpp); one on the player's own network turns it off.
   static void SetNatServer(uint32_t address_be);
+  // A player on this console's own network whose way to the internet is another
+  // (a VPN on one of the two): datagrams to its address on the internet go to
+  // its address here as well, until one comes back from here - then here only.
+  static void SetNatNeighbour(uint32_t public_be, uint32_t local_be);
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
