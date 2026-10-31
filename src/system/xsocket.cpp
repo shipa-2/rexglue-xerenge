@@ -242,7 +242,34 @@ bool Incoming(uint64_t fd, const uint8_t* data, size_t length, sockaddr_in* from
     }
     return true;
   }
-  if (auto found = g_back.find(PortKey(from->sin_addr.s_addr, from->sin_port)); found != g_back.end()) {
+  auto found = g_back.find(PortKey(from->sin_addr.s_addr, from->sin_port));
+  if (found == g_back.end() && !IsLocal(from->sin_addr.s_addr)) {
+    // A player's router that gives each destination a port of its own (a VPN's
+    // exit, a carrier's NAT): its datagrams to us come from a port other than
+    // the one the server saw, and ours sent there were lost - the game session
+    // on 8192 never came up, though 6000 did, answered where it came from. A
+    // datagram from a player we know, on this socket's port, says where that
+    // player really is for it: sent there from now on (as ICE's
+    // peer-reflexive addresses).
+    const auto socket = g_sockets.find(fd);
+    if (socket != g_sockets.end()) {
+      bool known = false;
+      for (const auto& [key, mapping] : g_out) {
+        known = known || mapping.address == from->sin_addr.s_addr;
+      }
+      if (known) {
+        const uint64_t key = PortKey(from->sin_addr.s_addr, socket->second);
+        const Mapping seen{from->sin_addr.s_addr, from->sin_port};
+        if (auto out = g_out.find(key); out == g_out.end() || out->second.port != seen.port) {
+          REXKRNL_INFO("--online: NAT - {}:{} is reached at {}:{} (seen)", Dotted(from->sin_addr.s_addr),
+                       ntohs(socket->second), Dotted(seen.address), ntohs(seen.port));
+          g_out[key] = seen;
+        }
+        found = g_back.insert_or_assign(PortKey(seen.address, seen.port), key).first;
+      }
+    }
+  }
+  if (found != g_back.end()) {
     from->sin_addr.s_addr = htonl(uint32_t(found->second >> 16));
     from->sin_port = htons(uint16_t(found->second & 0xFFFF));
   }
