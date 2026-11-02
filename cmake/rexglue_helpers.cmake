@@ -82,9 +82,16 @@ endfunction()
 function(rexglue_configure_target target_name)
     cmake_parse_arguments(ARG "" "" "GPU_PLUGINS" ${ARGN})
 
-    target_sources(${target_name} PRIVATE
-        ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp
-        ${REXGLUE_SHARE_DIR}/rex_app.cpp)
+    if(REX_UWP)
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_uwp.cpp
+            ${REXGLUE_SHARE_DIR}/rex_app.cpp)
+        target_link_options(${target_name} PRIVATE -Wl,/APPCONTAINER)
+    else()
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp
+            ${REXGLUE_SHARE_DIR}/rex_app.cpp)
+    endif()
 
     target_compile_definitions(${target_name} PRIVATE
         REXGLUE_BUILD_CONFIG="$<CONFIG>")

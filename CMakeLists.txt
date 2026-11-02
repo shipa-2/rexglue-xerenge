@@ -21,6 +21,13 @@ project(ReXGlue
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+# UWP (the Xbox One in Dev Mode): a CoreWindow instead of SDL, which has no UWP
+# backend; XInput and XAudio2; no Tracy; WindowsApp.lib for the system.
+option(REX_UWP "Build for UWP (Xbox One Dev Mode)" OFF)
+if(REX_UWP)
+    set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+    add_compile_definitions(REX_PLATFORM_UWP=1)
+endif()
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
 # Propagate profiling defines globally (compiled out in Release)
@@ -232,6 +239,11 @@ configure_file(
     ${CMAKE_CURRENT_BINARY_DIR}/include/rex/version.h
     @ONLY
 )
+
+# A UWP build keeps its own: the same machine builds the desktop one beside it.
+if(REX_UWP)
+    set(REX_PLATFORM "uwp-amd64")
+endif()
 
 # Output directories (multi-config appends /<Config>/ automatically)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")

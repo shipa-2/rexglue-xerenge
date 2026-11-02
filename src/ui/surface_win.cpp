@@ -16,6 +16,11 @@ namespace ui {
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
 bool Win32HwndSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+#if REX_PLATFORM_UWP
+  (void)width_out;
+  (void)height_out;
+  return false;
+#else
   RECT client_rect;
   if (!GetClientRect(hwnd(), &client_rect)) {
     return false;
@@ -24,6 +29,7 @@ bool Win32HwndSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) co
   width_out = uint32_t(client_rect.right);
   height_out = uint32_t(client_rect.bottom);
   return true;
+#endif
 }
 #endif
 

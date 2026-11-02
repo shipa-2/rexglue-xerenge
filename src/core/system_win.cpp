@@ -31,7 +31,14 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
       break;
   }
   auto wide = rex::string::to_utf16(message);
+#if REX_PLATFORM_UWP
+  // No message boxes on UWP: the debugger and the log have it.
+  (void)title;
+  (void)flags;
+  ::OutputDebugStringW(reinterpret_cast<const wchar_t*>(wide.c_str()));
+#else
   ::MessageBoxW(nullptr, reinterpret_cast<const wchar_t*>(wide.c_str()), title, flags);
+#endif
 }
 
 }  // namespace rex

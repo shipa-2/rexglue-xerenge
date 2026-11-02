@@ -97,6 +97,11 @@ if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
 endif()
 
+if(REX_UWP)
+    list(REMOVE_ITEM REXUI_SOURCES sdl_virtual_key.cpp window_sdl.cpp windowed_app_context_sdl.cpp)
+    list(APPEND REXUI_SOURCES window_uwp.cpp windowed_app_context_uwp.cpp)
+endif()
+
 add_library(rexui OBJECT ${REXUI_SOURCES})
 add_library(rex::ui ALIAS rexui)
 

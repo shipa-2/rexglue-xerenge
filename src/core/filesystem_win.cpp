@@ -22,6 +22,10 @@
 #include <rex/logging.h>
 #include <rex/string.h>
 
+#if REX_PLATFORM_UWP
+#include <winrt/Windows.Storage.h>
+#endif
+
 namespace rex {
 
 std::string path_to_utf8(const std::filesystem::path& path) {
@@ -54,11 +58,16 @@ std::filesystem::path GetExecutableFolder() {
 
 std::filesystem::path GetUserFolder() {
   std::filesystem::path result;
+#if REX_PLATFORM_UWP
+  // The app's own LocalState: the one place it may write.
+  result = std::wstring(winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path());
+#else
   PWSTR path;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &path))) {
     result.assign(path);
     CoTaskMemFree(path);
   }
+#endif
   return result;
 }
 

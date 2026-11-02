@@ -146,10 +146,12 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
       RemoveVectoredExceptionHandler(veh_handle_);
       veh_handle_ = nullptr;
     }
+#if !REX_PLATFORM_UWP
     if (vch_handle_) {
       RemoveVectoredContinueHandler(vch_handle_);
       vch_handle_ = nullptr;
     }
+#endif
   }
 }
 

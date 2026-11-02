@@ -15,6 +15,13 @@ add_library(rexaudio OBJECT
     sdl/sdl_audio_system.cpp
     sdl/sdl_audio_driver.cpp
 )
+if(REX_UWP)
+    target_sources(rexaudio PRIVATE xaudio2/xaudio2_audio_system.cpp xaudio2/xaudio2_audio_driver.cpp)
+    target_link_libraries(rexaudio PUBLIC xaudio2)
+    get_target_property(_rexaudio_sources rexaudio SOURCES)
+    list(REMOVE_ITEM _rexaudio_sources sdl/sdl_audio_system.cpp sdl/sdl_audio_driver.cpp)
+    set_target_properties(rexaudio PROPERTIES SOURCES "${_rexaudio_sources}")
+endif()
 add_library(rex::audio ALIAS rexaudio)
 
 rex_target_pch(rexaudio

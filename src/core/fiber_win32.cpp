@@ -22,7 +22,12 @@ thread_local Fiber* Fiber::tls_current_ = nullptr;
 
 Fiber* Fiber::ConvertCurrentThread() {
   auto* f = new Fiber();
+#if REX_PLATFORM_UWP
+  // UWP has the Ex forms only.
+  f->handle_ = ::ConvertThreadToFiberEx(nullptr, 0);
+#else
   f->handle_ = ::ConvertThreadToFiber(nullptr);
+#endif
   if (!f->handle_) {
     delete f;
     return nullptr;
@@ -34,7 +39,12 @@ Fiber* Fiber::ConvertCurrentThread() {
 
 Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
   auto* f = new Fiber();
+#if REX_PLATFORM_UWP
+  f->handle_ = ::CreateFiberEx(stack_size, stack_size, 0,
+                               reinterpret_cast<LPFIBER_START_ROUTINE>(entry), arg);
+#else
   f->handle_ = ::CreateFiber(stack_size, reinterpret_cast<LPFIBER_START_ROUTINE>(entry), arg);
+#endif
   if (!f->handle_) {
     delete f;
     return nullptr;
