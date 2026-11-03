@@ -27,6 +27,22 @@
 #include <rex/logging.h>
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_uwp.h>
+#include <rex/ui/uwp_game_setup.h>
+
+namespace rex::ui {
+namespace {
+UwpGameSetupFn& GameSetup() {
+  static UwpGameSetupFn setup = nullptr;
+  return setup;
+}
+}  // namespace
+void SetUwpGameSetup(UwpGameSetupFn setup) {
+  GameSetup() = setup;
+}
+UwpGameSetupFn GetGameSetupForRun() {
+  return GameSetup();
+}
+}  // namespace rex::ui
 
 namespace {
 
@@ -102,6 +118,20 @@ struct View : winrt::implements<View, IFrameworkViewSource, IFrameworkView> {
   void Uninitialize() {}
   void SetWindow(winrt::Windows::UI::Core::CoreWindow const&) {}
   void Run() {
+    // No game yet: the app's first-run step (the disc image, for Burnout).
+    const std::filesystem::path package = std::wstring(
+        winrt::Windows::ApplicationModel::Package::Current().InstalledLocation().Path());
+    const std::filesystem::path local = std::wstring(
+        winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path());
+    if (!std::filesystem::exists(package / "game" / "default.xex") &&
+        !std::filesystem::exists(local / "game" / "default.xex")) {
+      auto setup = rex::ui::GetGameSetupForRun();
+      winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Activate();
+      if (!setup || !setup(local / "game")) {
+        CoreApplication::Exit();
+        return;
+      }
+    }
     // The renderer and shaders an Xbox One has: D3D12, shader model 5.1.
     _putenv_s("XERENGE_RENDER_API", "d3d12");
     _putenv_s("XERENGE_D3D12_SHADERS", "dxbc");
