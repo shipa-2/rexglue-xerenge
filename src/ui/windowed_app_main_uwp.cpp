@@ -289,6 +289,12 @@ struct View : winrt::implements<View, IFrameworkViewSource, IFrameworkView> {
   void Uninitialize() {}
   void SetWindow(winrt::Windows::UI::Core::CoreWindow const& window) {
     rex::ui::UWPWindowedAppContext::SetCoreWindow(winrt::get_abi(window));
+    // B on an Xbox pad is the system's Back: left unhandled, it closes the app
+    // and drops the player into Dev Home. The game reads B itself.
+    winrt::Windows::UI::Core::SystemNavigationManager::GetForCurrentView().BackRequested(
+        [](auto const&, winrt::Windows::UI::Core::BackRequestedEventArgs const& args) {
+          args.Handled(true);
+        });
   }
   void Run() {
     // No game yet: the app's first-run step (the disc image, for Burnout).
