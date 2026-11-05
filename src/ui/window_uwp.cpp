@@ -103,7 +103,7 @@ bool WindowUWP::OpenImpl() {
 
   uint32_t width = 0, height = 0;
   PhysicalSize(width, height);
-  REXLOG_INFO("UWP: CoreWindow {}x{}", width, height);
+  REXLOG_INFO("UWP: CoreWindow {}x{}, {}", width, height, window.Visible() ? "visible" : "not visible");
   WindowDestructionReceiver destruction_receiver(this);
   OnActualSizeUpdate(width, height, destruction_receiver);
   if (destruction_receiver.IsWindowDestroyed()) {
@@ -149,6 +149,7 @@ void WindowUWP::HandleSizeChanged() {
 }
 
 void WindowUWP::HandleVisibilityChanged(bool visible) {
+  REXLOG_INFO("UWP: window {}", visible ? "visible" : "hidden");
   WindowDestructionReceiver destruction_receiver(this);
   OnFocusUpdate(visible, destruction_receiver);
 }

@@ -35,3 +35,17 @@
 #undef DeleteBitmap
 #undef DeleteFile
 #undef GetFirstChild
+
+#if REX_PLATFORM_UWP
+// UWP: files outside the app's own folders - a game on a USB drive the player
+// picked - are reached only through the brokered *FromApp calls; the plain ones
+// are refused there. Same arguments, so the core's Win32 code takes them as is.
+#include <fileapifromapp.h>
+#define CreateFileW CreateFileFromAppW
+#define GetFileAttributesExW GetFileAttributesExFromAppW
+#define CreateDirectoryW CreateDirectoryFromAppW
+inline HANDLE RexFindFirstFileFromApp(LPCWSTR name, LPWIN32_FIND_DATAW data) {
+  return FindFirstFileExFromAppW(name, FindExInfoStandard, data, FindExSearchNameMatch, nullptr, 0);
+}
+#define FindFirstFileW RexFindFirstFileFromApp
+#endif

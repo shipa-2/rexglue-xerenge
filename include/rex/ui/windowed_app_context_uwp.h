@@ -23,6 +23,12 @@ class UWPWindowedAppContext final : public WindowedAppContext {
 
   // The CoreWindow, as an IUnknown* (winrt::get_abi).
   static void* CoreWindowAbi();
+  // Keep the window IFrameworkView::SetWindow hands us; GetForCurrentThread
+  // is not enough on Xbox for the compositor to replace the splash.
+  static void SetCoreWindow(void* abi);
+  // Activate and drain the dispatcher so the splash can go away.
+  static void PumpEvents();
+  static bool UILoopRunning();
 };
 
 }  // namespace rex::ui

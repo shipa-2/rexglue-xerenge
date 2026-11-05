@@ -5,6 +5,7 @@
 
 #include <rex/ui/windowed_app_context_uwp.h>
 
+#include <atomic>
 #include <cstdlib>
 
 #include <winrt/Windows.Foundation.h>
@@ -17,12 +18,34 @@ using winrt::Windows::UI::Core::CoreProcessEventsOption;
 using winrt::Windows::UI::Core::CoreWindow;
 
 namespace {
-// The UI thread's window, kept for the threads that post to its dispatcher.
 CoreWindow g_core_window{nullptr};
+std::atomic<bool> g_loop_running{false};
 }  // namespace
 
 UWPWindowedAppContext::~UWPWindowedAppContext() {
   ExecutePendingFunctionsFromUIThread();
+}
+
+void UWPWindowedAppContext::SetCoreWindow(void* abi) {
+  g_core_window = nullptr;
+  if (abi) {
+    winrt::copy_from_abi(g_core_window, abi);
+  }
+}
+
+bool UWPWindowedAppContext::UILoopRunning() {
+  return g_loop_running.load();
+}
+
+void UWPWindowedAppContext::PumpEvents() {
+  if (!g_core_window) {
+    g_core_window = CoreWindow::GetForCurrentThread();
+  }
+  if (!g_core_window) {
+    return;
+  }
+  g_core_window.Activate();
+  g_core_window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
 }
 
 void* UWPWindowedAppContext::CoreWindowAbi() {
@@ -33,8 +56,6 @@ void* UWPWindowedAppContext::CoreWindowAbi() {
 }
 
 void UWPWindowedAppContext::NotifyUILoopOfPendingFunctions() {
-  // RunAsync may be called from any thread; the dispatcher runs the call on
-  // the UI thread from inside ProcessEvents.
   if (g_core_window) {
     g_core_window.Dispatcher().RunAsync(CoreDispatcherPriority::Normal,
                                         [this] { ExecutePendingFunctionsFromUIThread(); });
@@ -49,11 +70,10 @@ int UWPWindowedAppContext::RunMainMessageLoop() {
   if (!g_core_window) {
     g_core_window = CoreWindow::GetForCurrentThread();
   }
+  g_loop_running.store(true);
   auto dispatcher = g_core_window.Dispatcher();
-  // Anything posted before the loop started.
   ExecutePendingFunctionsFromUIThread();
   while (!HasQuitFromUIThread()) {
-    // Blocks until there is an event or a posted call, then handles all of them.
     dispatcher.ProcessEvents(CoreProcessEventsOption::ProcessOneAndAllPending);
   }
   return EXIT_SUCCESS;
