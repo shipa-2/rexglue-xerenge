@@ -14,6 +14,14 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include "platform_win.h"
 
 #include <spdlog/spdlog.h>
+#include <rex/logging.h>
+#include <algorithm>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
@@ -370,6 +378,75 @@ std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
   }
 }
 
+// XERENGE_THREAD_CPU: every thread made here, with its name, and every two
+// seconds the share of a core each one used - which of them a frame waits on.
+namespace {
+struct ThreadCpuEntry {
+  HANDLE handle = nullptr;
+  std::string name;
+  uint64_t last = 0;
+};
+std::mutex g_thread_cpu_mutex;
+std::unordered_map<DWORD, ThreadCpuEntry>& ThreadCpuTable() {
+  static std::unordered_map<DWORD, ThreadCpuEntry> table;
+  return table;
+}
+// Asked each time: the first threads start before env.txt is read.
+bool ThreadCpuWanted() { return std::getenv("XERENGE_THREAD_CPU") != nullptr; }
+uint64_t ThreadCpu100ns(HANDLE handle) {
+  FILETIME created, exited, kernel, user;
+  if (!GetThreadTimes(handle, &created, &exited, &kernel, &user)) {
+    return 0;
+  }
+  return (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+         (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+}
+void ThreadCpuMonitor() {
+  for (;;) {
+    ::Sleep(2000);
+    std::vector<std::pair<uint64_t, std::string>> used;
+    {
+      std::lock_guard lock(g_thread_cpu_mutex);
+      for (auto& [id, entry] : ThreadCpuTable()) {
+        const uint64_t now = ThreadCpu100ns(entry.handle);
+        if (now > entry.last) {
+          used.emplace_back(now - entry.last, entry.name.empty() ? std::to_string(id) : entry.name);
+        }
+        entry.last = now;
+      }
+    }
+    std::sort(used.begin(), used.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string line;
+    for (size_t i = 0; i < used.size() && i < 12; ++i) {
+      // 2 s of 100 ns ticks is 20,000,000: per cent of one core.
+      line += fmt::format(" {}={}%", used[i].second, used[i].first / 200000);
+    }
+    REXLOG_INFO("threads (share of one core over 2 s):{}", line);
+  }
+}
+void ThreadCpuRegister() {
+  if (!ThreadCpuWanted()) {
+    return;
+  }
+  HANDLE real = nullptr;
+  DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &real, 0, FALSE,
+                  DUPLICATE_SAME_ACCESS);
+  {
+    std::lock_guard lock(g_thread_cpu_mutex);
+    ThreadCpuTable()[GetCurrentThreadId()].handle = real;
+  }
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(ThreadCpuMonitor).detach(); });
+}
+void ThreadCpuName(DWORD id, const std::string& name) {
+  std::lock_guard lock(g_thread_cpu_mutex);
+  auto it = ThreadCpuTable().find(id);
+  if (it != ThreadCpuTable().end()) {
+    it->second.name = name;
+  }
+}
+}  // namespace
+
 class Win32Thread : public Win32Handle<Thread> {
  public:
   explicit Win32Thread(HANDLE handle) : Win32Handle(handle) {}
@@ -377,6 +454,7 @@ class Win32Thread : public Win32Handle<Thread> {
 
   void set_name(std::string name) override {
     set_thread_name_impl(handle_, name);
+    ThreadCpuName(GetThreadId(handle_), name);
     Thread::set_name(name);
   }
 
@@ -451,6 +529,7 @@ struct ThreadStartData {
   std::function<void()> start_routine;
 };
 DWORD WINAPI ThreadStartRoutine(LPVOID parameter) {
+  ThreadCpuRegister();
   current_thread_ = std::make_unique<Win32Thread>(::GetCurrentThread());
 
   auto start_data = reinterpret_cast<ThreadStartData*>(parameter);
