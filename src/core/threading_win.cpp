@@ -16,7 +16,10 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include <spdlog/spdlog.h>
 #include <rex/logging.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -401,9 +404,138 @@ uint64_t ThreadCpu100ns(HANDLE handle) {
   return (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
          (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
 }
+// XERENGE_PROFILE (with XERENGE_THREAD_CPU): the busiest thread of the last two
+// seconds sampled about every millisecond - paused, its instruction pointer
+// read, resumed - and every ten seconds the most frequent addresses logged as
+// module + offset, for the build's symbols to name (llvm-symbolizer).
+std::atomic<HANDLE> g_profile_target{nullptr};
+std::string g_profile_target_name;
+void ProfileSampler() {
+  // Per thread, for the whole run: the busiest changes from screen to screen.
+  std::map<std::string, std::unordered_map<uint64_t, uint32_t>> all_hits;
+  std::map<std::string, uint32_t> all_samples;
+  std::unordered_map<uint64_t, uint32_t> callers;  // the title code above a sample outside it
+  std::unordered_map<uint64_t, uint32_t> hits;
+  uint32_t samples = 0;
+  ULONGLONG since = GetTickCount64();
+  for (;;) {
+    ::Sleep(1);
+    const HANDLE target = g_profile_target.load();
+    if (target && SuspendThread(target) != DWORD(-1)) {
+      CONTEXT context = {};
+      context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+      if (GetThreadContext(target, &context)) {
+        // The first frame in the title's own code (burnout.exe), unwound from the
+        // sample: the guest function a wait or a helper is reached from.
+        uint64_t caller = 0;
+        {
+          static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+          CONTEXT walk = context;
+          for (int frame = 0; frame < 24 && walk.Rip; ++frame) {
+            HMODULE module = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(walk.Rip), &module) &&
+                reinterpret_cast<uint64_t>(module) == exe) {
+              caller = walk.Rip;
+              break;
+            }
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(walk.Rip, &image, nullptr);
+            if (!entry) {
+              walk.Rip = *reinterpret_cast<DWORD64*>(walk.Rsp);
+              walk.Rsp += 8;
+              continue;
+            }
+            PVOID handler_data = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data, &establisher, nullptr);
+          }
+        }
+        if (caller && caller != context.Rip) {
+          ++callers[caller];
+        }
+        ++hits[context.Rip];
+        ++samples;
+        std::string who;
+        {
+          std::lock_guard lock(g_thread_cpu_mutex);
+          who = g_profile_target_name;
+        }
+        ++all_hits[who][context.Rip];
+        ++all_samples[who];
+      }
+      ResumeThread(target);
+    }
+    if (GetTickCount64() - since < 10000) {
+      continue;
+    }
+    since = GetTickCount64();
+    // By module and offset: gathered per address, summed per module + offset.
+    std::vector<std::pair<uint32_t, std::string>> top;
+    for (const auto& [rip, count] : hits) {
+      HMODULE module = nullptr;
+      std::string where;
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(rip), &module) && module) {
+        wchar_t path[MAX_PATH] = L"";
+        GetModuleFileNameW(module, path, MAX_PATH);
+        std::wstring name(path);
+        name = name.substr(name.find_last_of(L"\\/") + 1);
+        where = fmt::format("{}+0x{:X}", std::string(name.begin(), name.end()),
+                            rip - reinterpret_cast<uint64_t>(module));
+      } else {
+        where = fmt::format("0x{:X}", rip);
+      }
+      top.emplace_back(count, where);
+    }
+    std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string line;
+    for (size_t i = 0; i < top.size() && i < 40; ++i) {
+      line += fmt::format(" {}={:.1f}%", top[i].second, 100.0 * top[i].first / std::max(samples, 1u));
+    }
+    std::string name;
+    {
+      std::lock_guard lock(g_thread_cpu_mutex);
+      name = g_profile_target_name;
+    }
+    REXLOG_INFO("profile of {} ({} samples):{}", name, samples, line);
+    // Every address, to be named and summed per function offline.
+    if (const char* dir = std::getenv("XERENGE_PROFILE_FILE")) {
+      if (std::FILE* out = std::fopen(dir, "w")) {
+        {
+          static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+          std::fprintf(out, "## callers in burnout.exe of samples outside it\n");
+          for (const auto& [rip, count] : callers) {
+            std::fprintf(out, "%u caller 0x%llX\n", count, (unsigned long long)(rip - exe));
+          }
+        }
+        for (const auto& [who, thread_hits] : all_hits) {
+          std::fprintf(out, "# %s %u samples\n", who.c_str(), all_samples[who]);
+          for (const auto& [rip, count] : thread_hits) {
+            HMODULE module = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(rip), &module) && module) {
+              wchar_t path[MAX_PATH] = L"";
+              GetModuleFileNameW(module, path, MAX_PATH);
+              std::wstring file(path);
+              file = file.substr(file.find_last_of(L"\\/") + 1);
+              std::fprintf(out, "%u %ls 0x%llX\n", count, file.c_str(),
+                           (unsigned long long)(rip - reinterpret_cast<uint64_t>(module)));
+            }
+          }
+        }
+        std::fclose(out);
+      }
+    }
+    hits.clear();
+    samples = 0;
+  }
+}
+
 void ThreadCpuMonitor() {
   for (;;) {
     ::Sleep(2000);
+    uint64_t busiest = 0;
     std::vector<std::pair<uint64_t, std::string>> used;
     {
       std::lock_guard lock(g_thread_cpu_mutex);
@@ -411,6 +543,11 @@ void ThreadCpuMonitor() {
         const uint64_t now = ThreadCpu100ns(entry.handle);
         if (now > entry.last) {
           used.emplace_back(now - entry.last, entry.name.empty() ? std::to_string(id) : entry.name);
+          if (now - entry.last > busiest) {
+            busiest = now - entry.last;
+            g_profile_target.store(entry.handle);
+            g_profile_target_name = entry.name;
+          }
         }
         entry.last = now;
       }
@@ -436,7 +573,12 @@ void ThreadCpuRegister() {
     ThreadCpuTable()[GetCurrentThreadId()].handle = real;
   }
   static std::once_flag once;
-  std::call_once(once, [] { std::thread(ThreadCpuMonitor).detach(); });
+  std::call_once(once, [] {
+    std::thread(ThreadCpuMonitor).detach();
+    if (std::getenv("XERENGE_PROFILE") != nullptr) {
+      std::thread(ProfileSampler).detach();
+    }
+  });
 }
 void ThreadCpuName(DWORD id, const std::string& name) {
   std::lock_guard lock(g_thread_cpu_mutex);
