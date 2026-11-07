@@ -931,14 +931,11 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   uint32_t unused_host_suspend_count = 0;
 
-#if REX_PLATFORM_WIN32
-  uint8_t previous_suspend_count =
-      reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_sub(1);
-  if (out_suspend_count) {
-    *out_suspend_count = previous_suspend_count;
-  }
-  return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+  // Windows as well (the Xbox One): its own path decremented a count already
+  // at 0 (wrapping to 255) and kept no early resume, so a movie worker that
+  // was resumed just before it suspended itself slept for good - the freezes
+  // at the logo, the garage and a race's start.
   bool should_resume_host = false;
   {
     std::lock_guard<std::mutex> lock(suspend_mutex_);
@@ -988,7 +985,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
 }
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_WIN32
 uint32_t XThread::SelfSuspend() {
   auto guest_thread = guest_object<X_KTHREAD>();
   std::unique_lock<std::mutex> lock(suspend_mutex_);

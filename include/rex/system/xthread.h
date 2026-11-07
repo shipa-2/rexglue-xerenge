@@ -382,7 +382,7 @@ class XThread : public XObject {
   uint32_t suspend_count();
   X_STATUS Resume(uint32_t* out_suspend_count = nullptr);
   X_STATUS Suspend(uint32_t* out_suspend_count = nullptr);
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_WIN32
   // Increment suspend count and block until another thread resumes us.
   uint32_t SelfSuspend();
 #endif
@@ -434,7 +434,7 @@ class XThread : public XObject {
 
   int32_t priority_ = 0;
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_WIN32
   std::mutex suspend_mutex_;
   std::condition_variable suspend_cv_;
   // A resume that came while the thread still ran, kept (one at most) for the
