@@ -336,6 +336,17 @@ bool NeighbourCopy(const sockaddr_in& to, sockaddr_in* copy) {
 
 }  // namespace
 
+void XSocket::NatRegisterAgain() {
+  std::lock_guard<std::mutex> lock(nat::g_mutex);
+  if (!nat::g_server) {
+    return;
+  }
+  for (const auto& [fd, port] : nat::g_sockets) {
+    nat::Register(fd, port);
+  }
+  REXKRNL_INFO("--online: NAT - {} socket(s) registered again from the new network", nat::g_sockets.size());
+}
+
 void XSocket::SetNatNeighbour(uint32_t public_be, uint32_t local_be) {
   std::lock_guard<std::mutex> lock(nat::g_mutex);
   nat::g_neighbours[public_be] = local_be;

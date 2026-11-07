@@ -250,7 +250,11 @@ uint32_t OnlineLocalAddress() {
       char text[INET_ADDRSTRLEN] = "?";
       inet_ntop(AF_INET, &found, text, sizeof(text));
       REXKRNL_INFO("--online: this console's address is {}{}", text, address ? " now" : "");
+      const bool changed = address != 0;
       address = found;
+      if (changed) {
+        XSocket::NatRegisterAgain();
+      }
     }
   }
   return address;

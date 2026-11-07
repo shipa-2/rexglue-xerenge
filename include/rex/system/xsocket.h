@@ -143,6 +143,10 @@ class XSocket : public XObject {
   // (a VPN on one of the two): datagrams to its address on the internet go to
   // its address here as well, until one comes back from here - then here only.
   static void SetNatNeighbour(uint32_t public_be, uint32_t local_be);
+  // This console's address changed (its network did): its sockets registered
+  // with the lobby server again at once, from where they are now, not at the
+  // next 20 s renewal - the others gave up on it before that.
+  static void NatRegisterAgain();
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
