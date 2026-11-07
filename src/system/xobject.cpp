@@ -32,6 +32,7 @@
 #include <rex/system/xnotifylistener.h>
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xsymboliclink.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
 namespace rex::system {
@@ -260,6 +261,68 @@ class LongWaitProbe {
   bool active_ = false;
   std::chrono::steady_clock::time_point start_;
 };
+
+// XERENGE_STUCK_WAIT_SECONDS=N: a wait with no timeout is made in slices of N
+// seconds, and each slice that runs out is reported - the objects, the thread,
+// and the guest callers (the stack's back chain: a frame's word 0 is its
+// caller's frame, whose return address is 8 bytes below) - then the wait goes
+// on. A deadlock says what it waits on instead of looking like a freeze, and
+// nothing else about the wait changes. Every kernel wait comes through here.
+uint32_t StuckWaitSeconds() {
+  static const uint32_t seconds = [] {
+    const char* text = std::getenv("XERENGE_STUCK_WAIT_SECONDS");
+    return text ? uint32_t(std::strtoul(text, nullptr, 10)) : 0u;
+  }();
+  return seconds;
+}
+
+void ReportStuckWait(const char* kind, XObject* const* objects, uint32_t count, uint32_t waited) {
+  std::string what;
+  for (uint32_t i = 0; i < count && i < 4; ++i) {
+    what += fmt::format(" {:08X}/type{}", objects[i]->guest_object(), uint32_t(objects[i]->type()));
+  }
+  std::string callers;
+  XThread* thread = XThread::GetCurrentThread();
+  auto* state = rex::runtime::ThreadState::Get();
+  // Only inside this thread's own stack: the outermost frame's back chain
+  // points at the stack's end, and the page past it is not mapped.
+  const uint32_t stack_end = thread ? thread->stack_base() : 0;
+  PPCContext* ctx = state ? state->context() : nullptr;
+  if (ctx && stack_end) {
+    auto* memory = REX_KERNEL_MEMORY();
+    uint32_t sp = ctx->r1.u32;
+    callers = fmt::format(" lr {:08X}", uint32_t(ctx->lr));
+    for (int depth = 0; depth < 12 && sp >= 8 && sp < stack_end; ++depth) {
+      const uint32_t next = *memory->TranslateVirtual<rex::be<uint32_t>*>(sp);
+      if (next <= sp || next > stack_end) {
+        break;
+      }
+      callers += fmt::format(" {:08X}", uint32_t(*memory->TranslateVirtual<rex::be<uint32_t>*>(next - 8)));
+      sp = next;
+    }
+  }
+  REXKRNL_WARN("stuck wait: {} {}s on{} - thread {:08X} '{}'{}", kind, waited, what,
+               thread ? thread->thread_id() : 0, thread ? thread->name() : std::string("?"),
+               callers);
+}
+
+// wait(timeout) in reported slices when the switch is on and the timeout is
+// infinite; timed_out(result) says a slice ran out.
+template <typename Wait, typename TimedOut>
+auto WaitReportingStuck(const char* kind, XObject* const* objects, uint32_t count,
+                        std::chrono::milliseconds timeout, Wait&& wait, TimedOut&& timed_out) {
+  const uint32_t seconds = StuckWaitSeconds();
+  if (seconds == 0 || timeout != std::chrono::milliseconds::max()) {
+    return wait(timeout);
+  }
+  for (uint32_t waited = seconds;; waited += seconds) {
+    auto result = wait(std::chrono::milliseconds(seconds * 1000ull));
+    if (!timed_out(result)) {
+      return result;
+    }
+    ReportStuckWait(kind, objects, count, waited);
+  }
+}
 }  // namespace
 
 bool MainThreadWaitNotesEnabled() {
@@ -326,7 +389,10 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  auto result = WaitReportingStuck(
+      "wait", &self, 1, timeout_ms,
+      [&](std::chrono::milliseconds ms) { return rex::thread::Wait(wait_handle, alertable ? true : false, ms); },
+      [](rex::thread::WaitResult r) { return r == rex::thread::WaitResult::kTimeout; });
   XThread::CheckTitleTermination();
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
@@ -388,8 +454,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
 
   XThread::CheckTitleTermination();
   if (wait_type) {
-    auto result =
-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    auto result = WaitReportingStuck(
+        "wait-any", objects, count, timeout_ms,
+        [&](std::chrono::milliseconds ms) { return rex::thread::WaitAny(wait_handles, alertable ? true : false, ms); },
+        [](const auto& r) { return r.first == rex::thread::WaitResult::kTimeout; });
     XThread::CheckTitleTermination();
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
@@ -409,8 +477,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         return X_STATUS_UNSUCCESSFUL;
     }
   } else {
-    auto result =
-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+    auto result = WaitReportingStuck(
+        "wait-all", objects, count, timeout_ms,
+        [&](std::chrono::milliseconds ms) { return rex::thread::WaitAll(wait_handles, alertable ? true : false, ms); },
+        [](rex::thread::WaitResult r) { return r == rex::thread::WaitResult::kTimeout; });
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
