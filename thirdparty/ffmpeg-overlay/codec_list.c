@@ -14,4 +14,7 @@ static const AVCodec* const codec_list[] = {
 #if CONFIG_XMAFRAMES_DECODER
     &ff_xmaframes_decoder,
 #endif
+#if CONFIG_WMV3_DECODER
+    &ff_wmv3_decoder,
+#endif
     NULL};
