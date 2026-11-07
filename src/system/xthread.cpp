@@ -28,6 +28,7 @@
 #include <rex/runtime.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
+#include <rex/thread/mutex.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
@@ -1043,6 +1044,19 @@ uint32_t XThread::SelfSuspend() {
 void XThread::SuspendPoint() {
   if (!suspend_requested_.load(std::memory_order_acquire)) {
     return;
+  }
+  // Not while the guest has interrupts disabled (it holds the global critical
+  // region, which everything else needs) or runs at raised IRQL (holding a
+  // spinlock): the console defers a suspend until then too. A later kernel
+  // call stops it.
+  if (rex::thread::global_critical_region::guest_depth() > 0) {
+    return;
+  }
+  if (auto* ctx = thread_state_ ? thread_state_->context() : nullptr) {
+    auto* pcr = memory()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+    if (pcr && pcr->current_irql != 0) {
+      return;
+    }
   }
   auto guest_thread = guest_object<X_KTHREAD>();
   std::unique_lock<std::mutex> lock(suspend_mutex_);
