@@ -742,7 +742,30 @@ Captured* g_captured = nullptr;
 uint8_t* g_stacks = nullptr;
 char* g_text = nullptr;
 
+// Where the watchdog is, in a file beside the snapshot (freeze-state), so a
+// snapshot that does not come back says at which step it stopped. Kernel
+// calls only, like the snapshot itself.
+std::wstring g_mark_path;
+void Mark(const char* what, uint64_t n) {
+  if (g_mark_path.empty()) {
+    return;
+  }
+  char line[96];
+  Out out{line, sizeof(line) - 1, 0};
+  out.Text(what);
+  out.Text(" ");
+  out.Dec(n);
+  out.Text("\n");
+  HANDLE f = CreateFile2(g_mark_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS, nullptr);
+  if (f != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(f, line, DWORD(out.used), &written, nullptr);
+    CloseHandle(f);
+  }
+}
+
 void DumpAllThreads(const wchar_t* file) {
+  Mark("dump: start", 0);
   const DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
   size_t count = 0;
   for (DWORD id = 4; id < 0x40000 && count < kMaxThreads; id += 4) {
@@ -758,6 +781,7 @@ void DumpAllThreads(const wchar_t* file) {
       CloseHandle(h);
       continue;
     }
+    Mark("dump: pausing thread", id);
     Captured& c = g_captured[count];
     c = Captured{id};
     uint8_t* stack = g_stacks + count * kStackCopy;
@@ -781,6 +805,7 @@ void DumpAllThreads(const wchar_t* file) {
       ResumeThread(h);
     }
     CloseHandle(h);
+    Mark("dump: done with thread", id);
     ++count;
   }
 
@@ -836,12 +861,14 @@ void DumpAllThreads(const wchar_t* file) {
       }
     }
   }
+  Mark("dump: writing", out.used);
   HANDLE f = CreateFile2(file, GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
   if (f != INVALID_HANDLE_VALUE) {
     DWORD written = 0;
     WriteFile(f, out.data, DWORD(out.used), &written, nullptr);
     CloseHandle(f);
   }
+  Mark("dump: written", out.used);
 }
 
 void FreezeWatchdog(uint32_t seconds, std::wstring file) {
@@ -850,6 +877,7 @@ void FreezeWatchdog(uint32_t seconds, std::wstring file) {
   g_stacks = new uint8_t[kMaxThreads * kStackCopy];
   g_text = new char[kTextBytes];
   const std::wstring trigger = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-now";
+  g_mark_path = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-state";
   uint64_t history[64] = {};
   uint32_t ticks = 0;
   bool dumped_idle = false;
@@ -862,12 +890,16 @@ void FreezeWatchdog(uint32_t seconds, std::wstring file) {
     }
     history[ticks % 64] = ProcessCpu100ns();
     ++ticks;
+    if (ticks % 10 == 0) {
+      Mark("watchdog: alive, tick", ticks);
+    }
     if (dumped_idle || ticks <= seconds || seconds >= 64) {
       continue;
     }
     const uint64_t used = history[(ticks - 1) % 64] - history[(ticks - 1 - seconds) % 64];
     // 3% of one core over the window, in 100 ns ticks.
     if (used < uint64_t(seconds) * 300000) {
+      Mark("watchdog: idle, dumping", ticks);
       DumpAllThreads(file.c_str());
       dumped_idle = true;
     }
