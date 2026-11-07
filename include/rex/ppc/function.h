@@ -402,8 +402,18 @@ void _translate_args_to_guest(PPCContext& ctx, uint8_t* base, std::tuple<TArgs..
 //=============================================================================
 // Calls a native C++ function with arguments extracted from PPC context
 
+}  // namespace rex::ppc
+namespace rex::system {
+// Where a guest thread another one has suspended stops (XThread::Suspend).
+void GuestSuspendPoint();
+}  // namespace rex::system
+namespace rex::ppc {
+
 template <auto Func>
 __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
+  struct SuspendPointOnReturn {
+    ~SuspendPointOnReturn() { rex::system::GuestSuspendPoint(); }
+  } suspend_point_on_return;
   using ret_t = decltype(std::apply(Func, function_args(Func)));
 
   auto args = function_args(Func);

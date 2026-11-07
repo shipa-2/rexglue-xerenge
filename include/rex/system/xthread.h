@@ -385,6 +385,9 @@ class XThread : public XObject {
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_WIN32
   // Increment suspend count and block until another thread resumes us.
   uint32_t SelfSuspend();
+  // Called after each kernel export on a guest thread: waits here while
+  // another thread has it suspended.
+  void SuspendPoint();
 #endif
   X_STATUS Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval);
 
@@ -440,6 +443,9 @@ class XThread : public XObject {
   // A resume that came while the thread still ran, kept (one at most) for the
   // suspend it is about to do itself; see SelfSuspend.
   bool early_resume_ = false;
+  // Suspended by another thread, to stop at its next safe point (see
+  // SuspendPoint) rather than wherever the host suspend would have caught it.
+  std::atomic<bool> suspend_requested_{false};
 #endif
 
   std::mutex thread_lock_;

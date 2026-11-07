@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <set>
 
 #include <fmt/format.h>
 
@@ -971,6 +972,41 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
 
 X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
+#if REX_PLATFORM_WIN32
+  // Another thread, on Windows: not a host SuspendThread, which stops it at
+  // any instruction - inside malloc, holding the heap's lock, it froze every
+  // thread that allocated next, including the one that would resume it (the
+  // freezes at the logo, the garage and race starts on the Xbox One). The
+  // thread stops at its next kernel call instead (SuspendPoint).
+  if (!IsInThread(this)) {
+    uint8_t previous;
+    {
+      std::lock_guard<std::mutex> lock(suspend_mutex_);
+      previous = guest_thread->suspend_count;
+      if (early_resume_ && previous == 0) {
+        // Resumed before this suspend came: as SelfSuspend does, neither.
+        early_resume_ = false;
+      } else {
+        guest_thread->suspend_count = uint8_t(previous + 1);
+        suspend_requested_.store(true, std::memory_order_release);
+      }
+    }
+    if (out_suspend_count) {
+      *out_suspend_count = previous;
+    }
+    static std::mutex logged_mutex;
+    static std::set<std::string> logged;
+    {
+      std::lock_guard<std::mutex> lock(logged_mutex);
+      if (logged.insert(thread_name_).second) {
+        REXKRNL_INFO("suspend: {} by {} - at its next kernel call", thread_name_,
+                     XThread::GetCurrentThread() ? XThread::GetCurrentThread()->name()
+                                                 : std::string("host"));
+      }
+    }
+    return X_STATUS_SUCCESS;
+  }
+#endif
   uint8_t previous_suspend_count =
       reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_add(1);
   if (out_suspend_count) {
@@ -1003,6 +1039,26 @@ uint32_t XThread::SelfSuspend() {
   suspend_cv_.wait(lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
   return previous;
 }
+
+void XThread::SuspendPoint() {
+  if (!suspend_requested_.load(std::memory_order_acquire)) {
+    return;
+  }
+  auto guest_thread = guest_object<X_KTHREAD>();
+  std::unique_lock<std::mutex> lock(suspend_mutex_);
+  suspend_cv_.wait(lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
+  suspend_requested_.store(false, std::memory_order_release);
+}
+
+// The safe point every kernel export passes on the way back to guest code
+// (HostToGuestFunction): a guest thread another one suspended stops here.
+void GuestSuspendPoint() {
+  if (XThread* thread = XThread::GetCurrentThread()) {
+    thread->SuspendPoint();
+  }
+}
+#else
+void GuestSuspendPoint() {}
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
