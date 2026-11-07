@@ -587,19 +587,39 @@ uint64_t ProcessCpu100ns() {
          (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
 }
 
-// module+offset of an address, as text.
+// module+offset of an address, as text - without the loader, whose lock a
+// frozen thread may hold (one did): the module's base from the memory map, its
+// name from the ones looked up when the watchdog started.
+std::vector<std::pair<uint64_t, std::string>>& KnownModules() {
+  static std::vector<std::pair<uint64_t, std::string>> modules;
+  return modules;
+}
+void NoteKnownModules() {
+  for (const wchar_t* name :
+       {L"burnout.exe", L"rexruntime.dll", L"rexgpu-plume.dll", L"ntdll.dll", L"KERNELBASE.dll",
+        L"kernel32.dll", L"ucrtbase.dll", L"d3d12.dll", L"D3D12Core.dll", L"d3d12x.dll",
+        L"combase.dll", L"MinUser.dll", L"XAudio2_9.dll", L"msvcp140.dll", L"vcruntime140.dll",
+        L"ws2_32.dll", L"dxgi.dll", L"shcore.dll"}) {
+    if (HMODULE m = GetModuleHandleW(name)) {
+      const std::wstring w(name);
+      KnownModules().emplace_back(reinterpret_cast<uint64_t>(m), std::string(w.begin(), w.end()));
+    }
+  }
+}
 std::string Frame(uint64_t address) {
-  HMODULE module = nullptr;
-  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCWSTR>(address), &module)) {
+  MEMORY_BASIC_INFORMATION info = {};
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) ||
+      !info.AllocationBase) {
     return fmt::format("0x{:X}", address);
   }
-  wchar_t path[MAX_PATH] = {};
-  GetModuleFileNameW(module, path, MAX_PATH);
-  std::wstring name(path);
-  name = name.substr(name.find_last_of(L"\\/") + 1);
-  return fmt::format("{}+0x{:X}", std::string(name.begin(), name.end()),
-                     address - reinterpret_cast<uint64_t>(module));
+  const uint64_t module = reinterpret_cast<uint64_t>(info.AllocationBase);
+  std::string name = fmt::format("module@{:X}", module);
+  for (const auto& [base, known] : KnownModules()) {
+    if (base == module) {
+      name = known;
+    }
+  }
+  return fmt::format("{}+0x{:X}", name, address - module);
 }
 
 void DumpAllThreads(const char* file) {
@@ -679,6 +699,7 @@ void FreezeWatchdog(uint32_t seconds, std::string file) {
   // Or on request: a file named freeze-now beside the output file (put there
   // through Device Portal) - a freeze in which something still spins, such as
   // the presenter, never falls under the threshold.
+  NoteKnownModules();
   const std::string trigger = file.substr(0, file.find_last_of("\\/") + 1) + "freeze-now";
   std::vector<uint64_t> history;
   for (;;) {
