@@ -577,12 +577,19 @@ void ThreadCpuMonitor() {
     REXLOG_INFO("threads (share of one core over 2 s):{}", line);
   }
 }
-// XERENGE_FREEZE_DUMP=N: when the whole process has used less than 3% of one
-// core for N seconds - a freeze, every thread blocked - each thread's native
-// stack is written to XERENGE_FREEZE_FILE (default freeze.txt here), once.
-// Every thread of the process, not only the ones made here: the renderer's and
-// the driver's are found by trying each thread id. Plain file writes, no
-// logger, which may be the very lock everything waits on.
+// XERENGE_FREEZE_DUMP=N: a snapshot of every thread of the process - the
+// renderer's and the driver's too, found by trying each thread id - written to
+// XERENGE_FREEZE_FILE (default freeze.txt here): once, when the process has
+// used under 3% of a core for N seconds, or each time a file named freeze-now
+// appears beside it (put there through Device Portal).
+//
+// Built for freezes in which a lock every thread needs is stuck - the heap's,
+// the loader's, the logger's. Nothing here takes one: the buffers are made
+// when the watchdog starts; a paused thread is only read by kernel calls (its
+// registers, a copy of its stack); the frames are then found by scanning that
+// copy for addresses inside the modules noted at start, formatted by hand into
+// a fixed buffer and written with WriteFile. Not the logger, not malloc, not
+// stdio, not the unwinder (whose function-table lock a paused thread may hold).
 uint64_t ProcessCpu100ns() {
   FILETIME created, exited, kernel, user;
   if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
@@ -592,44 +599,85 @@ uint64_t ProcessCpu100ns() {
          (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
 }
 
-// module+offset of an address, as text - without the loader, whose lock a
-// frozen thread may hold (one did): the module's base from the memory map, its
-// name from the ones looked up when the watchdog started.
-std::vector<std::pair<uint64_t, std::string>>& KnownModules() {
-  static std::vector<std::pair<uint64_t, std::string>> modules;
-  return modules;
-}
+struct KnownModule {
+  uint64_t base = 0, end = 0;
+  char name[24] = {};
+};
+KnownModule g_modules[24];
+int g_module_count = 0;
+
 void NoteKnownModules() {
-  for (const wchar_t* name :
-       {L"burnout.exe", L"rexruntime.dll", L"rexgpu-plume.dll", L"ntdll.dll", L"KERNELBASE.dll",
-        L"kernel32.dll", L"ucrtbase.dll", L"d3d12.dll", L"D3D12Core.dll", L"d3d12x.dll",
-        L"combase.dll", L"MinUser.dll", L"XAudio2_9.dll", L"msvcp140.dll", L"vcruntime140.dll",
-        L"ws2_32.dll", L"dxgi.dll", L"shcore.dll"}) {
-    if (HMODULE m = GetModuleHandleW(name)) {
-      const std::wstring w(name);
-      KnownModules().emplace_back(reinterpret_cast<uint64_t>(m), std::string(w.begin(), w.end()));
+  static const wchar_t* const names[] = {
+      L"burnout.exe",   L"rexruntime.dll", L"rexgpu-plume.dll", L"ntdll.dll",
+      L"KERNELBASE.dll", L"kernel32.dll",  L"ucrtbase.dll",     L"d3d12.dll",
+      L"D3D12Core.dll", L"d3d12x.dll",     L"combase.dll",      L"MinUser.dll",
+      L"XAudio2_9.dll", L"msvcp140.dll",   L"vcruntime140.dll", L"ws2_32.dll",
+      L"dxgi.dll",      L"shcore.dll",     L"mswsock.dll"};
+  for (const wchar_t* name : names) {
+    HMODULE m = GetModuleHandleW(name);
+    if (!m || g_module_count >= 24) {
+      continue;
+    }
+    const auto base = reinterpret_cast<uint64_t>(m);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    KnownModule& k = g_modules[g_module_count++];
+    k.base = base;
+    k.end = base + nt->OptionalHeader.SizeOfImage;
+    for (int i = 0; name[i] && i < 23; ++i) {
+      k.name[i] = char(name[i]);
     }
   }
 }
-std::string Frame(uint64_t address) {
-  MEMORY_BASIC_INFORMATION info = {};
-  if (!VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) ||
-      !info.AllocationBase) {
-    return fmt::format("0x{:X}", address);
-  }
-  const uint64_t module = reinterpret_cast<uint64_t>(info.AllocationBase);
-  std::string name = fmt::format("module@{:X}", module);
-  for (const auto& [base, known] : KnownModules()) {
-    if (base == module) {
-      name = known;
+const KnownModule* ModuleOf(uint64_t address) {
+  for (int i = 0; i < g_module_count; ++i) {
+    if (address >= g_modules[i].base && address < g_modules[i].end) {
+      return &g_modules[i];
     }
   }
-  return fmt::format("{}+0x{:X}", name, address - module);
+  return nullptr;
 }
 
-// The last exceptions any thread raised (first chance), for the freeze dump:
-// a thread that vanished leaves its cause here. Lock-free - written from
-// inside the exception - and fixed size.
+// Text into a fixed buffer, by hand.
+struct Out {
+  char* data = nullptr;
+  size_t size = 0, used = 0;
+  void Text(const char* s) {
+    while (*s && used < size) data[used++] = *s++;
+  }
+  void Hex(uint64_t v) {
+    char digits[17];
+    int n = 0;
+    do {
+      digits[n++] = "0123456789ABCDEF"[v & 15];
+      v >>= 4;
+    } while (v);
+    Text("0x");
+    while (n && used < size) data[used++] = digits[--n];
+  }
+  void Dec(uint64_t v) {
+    char digits[21];
+    int n = 0;
+    do {
+      digits[n++] = char('0' + v % 10);
+      v /= 10;
+    } while (v);
+    while (n && used < size) data[used++] = digits[--n];
+  }
+  void Frame(uint64_t address) {
+    if (const KnownModule* m = ModuleOf(address)) {
+      Text(m->name);
+      Text("+");
+      Hex(address - m->base);
+    } else {
+      Hex(address);
+    }
+  }
+};
+
+// The last exceptions any thread raised (first chance), for the snapshot: a
+// thread that vanished leaves its cause here. Lock-free and fixed size; the
+// faulting thread unwinds its own stack.
 struct ExceptionNote {
   std::atomic<uint32_t> sequence{0};
   DWORD code = 0, thread = 0;
@@ -641,10 +689,7 @@ std::atomic<uint32_t> g_exception_count{0};
 
 LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
-  // Not the debugger's thread names, not the guest's own memory faults in
-  // bulk (the write watch takes thousands): still, a fault is kept - the ring
-  // simply turns over.
-  if (code == 0x406D1388) {
+  if (code == 0x406D1388) {  // a debugger's thread name
     return EXCEPTION_CONTINUE_SEARCH;
   }
   const uint32_t n = g_exception_count.fetch_add(1, std::memory_order_relaxed);
@@ -669,15 +714,22 @@ LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void DumpAllThreads(const char* file) {
-  struct Captured {
-    DWORD id;
-    std::string name;
-    std::vector<uint64_t> frames;
-  };
-  std::vector<Captured> threads;
+constexpr size_t kMaxThreads = 160;
+constexpr size_t kStackCopy = 48 * 1024;
+constexpr size_t kTextBytes = 4 << 20;
+struct Captured {
+  DWORD id = 0;
+  uint64_t rip = 0, rsp = 0;
+  size_t stack_bytes = 0;
+};
+Captured* g_captured = nullptr;
+uint8_t* g_stacks = nullptr;
+char* g_text = nullptr;
+
+void DumpAllThreads(const wchar_t* file) {
   const DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
-  for (DWORD id = 4; id < 0x40000; id += 4) {
+  size_t count = 0;
+  for (DWORD id = 4; id < 0x40000 && count < kMaxThreads; id += 4) {
     if (id == self) {
       continue;
     }
@@ -690,99 +742,119 @@ void DumpAllThreads(const char* file) {
       CloseHandle(h);
       continue;
     }
-    Captured c{id, {}, {}};
-    c.frames.reserve(48);
+    Captured& c = g_captured[count];
+    c = Captured{id};
+    uint8_t* stack = g_stacks + count * kStackCopy;
     if (SuspendThread(h) != DWORD(-1)) {
-      CONTEXT walk = {};
-      walk.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-      if (GetThreadContext(h, &walk)) {
-        for (int frame = 0; frame < 40 && walk.Rip; ++frame) {
-          c.frames.push_back(walk.Rip);
-          DWORD64 image = 0;
-          PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(walk.Rip, &image, nullptr);
-          if (!entry) {
-            walk.Rip = *reinterpret_cast<DWORD64*>(walk.Rsp);
-            walk.Rsp += 8;
-            continue;
+      CONTEXT context = {};
+      context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+      if (GetThreadContext(h, &context)) {
+        c.rip = context.Rip;
+        c.rsp = context.Rsp;
+        // As much of the stack above rsp as can be read, by the kernel: a
+        // fault here would be this thread's, with the other one still paused.
+        for (size_t want = kStackCopy; want >= 4096; want /= 2) {
+          SIZE_T got = 0;
+          if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Rsp), stack,
+                                want, &got) && got) {
+            c.stack_bytes = got;
+            break;
           }
-          PVOID handler_data = nullptr;
-          DWORD64 establisher = 0;
-          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data,
-                           &establisher, nullptr);
         }
       }
       ResumeThread(h);
     }
-    PWSTR description = nullptr;
-    if (SUCCEEDED(GetThreadDescription(h, &description)) && description) {
-      std::wstring w(description);
-      c.name.assign(w.begin(), w.end());
-      LocalFree(description);
-    }
     CloseHandle(h);
-    threads.push_back(std::move(c));
+    ++count;
   }
-  FILE* out = std::fopen(file, "w");
-  if (!out) {
-    return;
-  }
-  std::fprintf(out, "freeze: %zu threads\n", threads.size());
-  for (const auto& c : threads) {
-    std::string name = c.name;
-    {
-      std::lock_guard lock(g_thread_cpu_mutex);
-      auto it = ThreadCpuTable().find(c.id);
-      if (name.empty() && it != ThreadCpuTable().end()) name = it->second.name;
-    }
-    std::fprintf(out, "\nthread %lu '%s'\n", c.id, name.c_str());
-    for (uint64_t f : c.frames) {
-      std::fprintf(out, "  %s\n", Frame(f).c_str());
+
+  Out out{g_text, kTextBytes, 0};
+  out.Text("freeze: ");
+  out.Dec(count);
+  out.Text(" threads (frames: rip, then return addresses found on the stack)\n");
+  for (size_t t = 0; t < count; ++t) {
+    const Captured& c = g_captured[t];
+    out.Text("\nthread ");
+    out.Dec(c.id);
+    out.Text("\n  ");
+    out.Frame(c.rip);
+    out.Text("\n");
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(g_stacks + t * kStackCopy);
+    int shown = 0;
+    for (size_t w = 0; w < c.stack_bytes / 8 && shown < 48; ++w) {
+      const uint64_t v = words[w];
+      if (const KnownModule* m = ModuleOf(v)) {
+        // Code, not data: an address just after a call is what is wanted, and
+        // the text sections are what the modules' ranges mostly are.
+        (void)m;
+        out.Text("  ");
+        out.Frame(v);
+        out.Text("\n");
+        ++shown;
+      }
     }
   }
   const uint32_t raised = g_exception_count.load(std::memory_order_acquire);
-  std::fprintf(out, "\nexceptions raised: %u, the last of them:\n", raised);
+  out.Text("\nexceptions raised: ");
+  out.Dec(raised);
+  out.Text(", the last of them:\n");
   for (uint32_t n = raised > 32 ? raised - 32 : 0; n < raised; ++n) {
     const ExceptionNote& note = g_exception_notes[n % 32];
     if (note.sequence.load(std::memory_order_acquire) != n + 1) {
       continue;
     }
-    std::fprintf(out, "#%u code %08lX thread %lu at %s\n", n, note.code, note.thread,
-                 Frame(note.address).c_str());
+    out.Text("#");
+    out.Dec(n);
+    out.Text(" code ");
+    out.Hex(note.code);
+    out.Text(" thread ");
+    out.Dec(note.thread);
+    out.Text(" at ");
+    out.Frame(note.address);
+    out.Text("\n");
     for (uint64_t f : note.frames) {
       if (f) {
-        std::fprintf(out, "    %s\n", Frame(f).c_str());
+        out.Text("    ");
+        out.Frame(f);
+        out.Text("\n");
       }
     }
   }
-  std::fclose(out);
+  HANDLE f = CreateFile2(file, GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
+  if (f != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(f, out.data, DWORD(out.used), &written, nullptr);
+    CloseHandle(f);
+  }
 }
 
-void FreezeWatchdog(uint32_t seconds, std::string file) {
-  // Or on request: a file named freeze-now beside the output file (put there
-  // through Device Portal) - a freeze in which something still spins, such as
-  // the presenter, never falls under the threshold.
+void FreezeWatchdog(uint32_t seconds, std::wstring file) {
   NoteKnownModules();
-  const std::string trigger = file.substr(0, file.find_last_of("\\/") + 1) + "freeze-now";
-  std::vector<uint64_t> history;
+  g_captured = new Captured[kMaxThreads];
+  g_stacks = new uint8_t[kMaxThreads * kStackCopy];
+  g_text = new char[kTextBytes];
+  const std::wstring trigger = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-now";
+  uint64_t history[64] = {};
+  uint32_t ticks = 0;
+  bool dumped_idle = false;
   for (;;) {
     ::Sleep(1000);
-    if (FILE* request = std::fopen(trigger.c_str(), "rb")) {
-      std::fclose(request);
-      std::remove(trigger.c_str());
+    if (GetFileAttributesW(trigger.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      DeleteFileW(trigger.c_str());
       DumpAllThreads(file.c_str());
       continue;
     }
-    history.push_back(ProcessCpu100ns());
-    if (history.size() <= seconds) {
+    history[ticks % 64] = ProcessCpu100ns();
+    ++ticks;
+    if (dumped_idle || ticks <= seconds || seconds >= 64) {
       continue;
     }
-    const uint64_t used = history.back() - history[history.size() - 1 - seconds];
+    const uint64_t used = history[(ticks - 1) % 64] - history[(ticks - 1 - seconds) % 64];
     // 3% of one core over the window, in 100 ns ticks.
     if (used < uint64_t(seconds) * 300000) {
       DumpAllThreads(file.c_str());
-      return;
+      dumped_idle = true;
     }
-    history.erase(history.begin());
   }
 }
 
@@ -798,7 +870,8 @@ void StartFreezeWatchdog() {
     const uint32_t seconds = std::max(2u, uint32_t(std::strtoul(text, nullptr, 10)));
     AddVectoredExceptionHandler(1, NoteException);
     const char* file = std::getenv("XERENGE_FREEZE_FILE");
-    std::thread(FreezeWatchdog, seconds, std::string(file && *file ? file : "freeze.txt")).detach();
+    const std::string narrow = file && *file ? file : "freeze.txt";
+    std::thread(FreezeWatchdog, seconds, std::wstring(narrow.begin(), narrow.end())).detach();
   }
 }
 void ThreadCpuRegister() {
