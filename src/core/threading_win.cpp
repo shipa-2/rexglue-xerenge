@@ -665,9 +665,19 @@ void DumpAllThreads(const char* file) {
 }
 
 void FreezeWatchdog(uint32_t seconds, std::string file) {
+  // Or on request: a file named freeze-now beside the output file (put there
+  // through Device Portal) - a freeze in which something still spins, such as
+  // the presenter, never falls under the threshold.
+  const std::string trigger = file.substr(0, file.find_last_of("\\/") + 1) + "freeze-now";
   std::vector<uint64_t> history;
   for (;;) {
     ::Sleep(1000);
+    if (FILE* request = std::fopen(trigger.c_str(), "rb")) {
+      std::fclose(request);
+      std::remove(trigger.c_str());
+      DumpAllThreads(file.c_str());
+      continue;
+    }
     history.push_back(ProcessCpu100ns());
     if (history.size() <= seconds) {
       continue;
