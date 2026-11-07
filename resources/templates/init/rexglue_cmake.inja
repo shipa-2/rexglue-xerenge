@@ -36,9 +36,12 @@ set(REXGLUE_RECOMP_DEBUG_INFO "line-tables-only" CACHE STRING
     "Debug info level for generated code: line-tables-only, full, or none")
 
 # Guest SEH scopes emit __try/__except, which traps hardware faults only under
-# asynchronous EH. clang++ spells that flag the GNU way.
+# asynchronous EH. clang++ spells that flag the GNU way. A title whose code has
+# no SEH scopes can turn it off (REXGLUE_RECOMP_ASYNC_EH=OFF): under it every
+# instruction may throw, which keeps the optimizer from inlining and moving code.
+option(REXGLUE_RECOMP_ASYNC_EH "Asynchronous EH for recompiled code (guest SEH scopes)" ON)
 set(REXGLUE_RECOMP_OPTIONS "")
-if(WIN32)
+if(WIN32 AND REXGLUE_RECOMP_ASYNC_EH)
     if(MSVC)
         list(APPEND REXGLUE_RECOMP_OPTIONS /EHa)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
