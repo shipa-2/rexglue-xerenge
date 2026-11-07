@@ -422,6 +422,7 @@ void ProfileSampler() {
     ::Sleep(1);
     const HANDLE target = g_profile_target.load();
     if (target && SuspendThread(target) != DWORD(-1)) {
+      uint64_t sampled_rip = 0, sampled_caller = 0;
       CONTEXT context = {};
       context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
       if (GetThreadContext(target, &context)) {
@@ -429,13 +430,17 @@ void ProfileSampler() {
         // sample: the guest function a wait or a helper is reached from.
         uint64_t caller = 0;
         {
+          // The executable's address range, read once: nothing that takes the
+          // loader lock while the thread is paused.
           static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+          static const uint64_t exe_end = [] {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + dos->e_lfanew);
+            return exe + nt->OptionalHeader.SizeOfImage;
+          }();
           CONTEXT walk = context;
           for (int frame = 0; frame < 24 && walk.Rip; ++frame) {
-            HMODULE module = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCWSTR>(walk.Rip), &module) &&
-                reinterpret_cast<uint64_t>(module) == exe) {
+            if (walk.Rip >= exe && walk.Rip < exe_end) {
               caller = walk.Rip;
               break;
             }
@@ -451,20 +456,26 @@ void ProfileSampler() {
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data, &establisher, nullptr);
           }
         }
-        if (caller && caller != context.Rip) {
-          ++callers[caller];
+        sampled_rip = context.Rip;
+        sampled_caller = caller;
+      }
+      // Resumed before anything that allocates or locks: the paused thread may
+      // hold the heap's lock, and waiting on it here froze the game for good.
+      ResumeThread(target);
+      if (sampled_rip) {
+        if (sampled_caller && sampled_caller != sampled_rip) {
+          ++callers[sampled_caller];
         }
-        ++hits[context.Rip];
+        ++hits[sampled_rip];
         ++samples;
         std::string who;
         {
           std::lock_guard lock(g_thread_cpu_mutex);
           who = g_profile_target_name;
         }
-        ++all_hits[who][context.Rip];
+        ++all_hits[who][sampled_rip];
         ++all_samples[who];
       }
-      ResumeThread(target);
     }
     if (GetTickCount64() - since < 10000) {
       continue;
