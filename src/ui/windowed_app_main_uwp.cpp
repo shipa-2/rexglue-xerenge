@@ -61,6 +61,8 @@ namespace {
 
 using namespace winrt::Windows::ApplicationModel::Core;
 
+std::vector<std::string>& ConfArguments();
+
 // Dev Home's "Manage developer storage" resizes this drive, not LocalState,
 // which keeps a few GB - too little for the extracted disc.
 const std::filesystem::path kScratchGame(LR"(D:\DevelopmentFiles\Xerenge\game)");
@@ -122,6 +124,7 @@ std::vector<std::string> MakeArguments() {
       "--log_max_files", "3",
       "--fullscreen",
   };
+  args.insert(args.end(), ConfArguments().begin(), ConfArguments().end());
   std::ifstream extra(local / "args.txt");
   for (std::string line; std::getline(extra, line);) {
     while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
@@ -148,6 +151,12 @@ void KeepStderr() {
     setvbuf(stderr, nullptr, _IONBF, 0);
     std::fputs("stderr kept here\n", stderr);
   }
+}
+
+// Arguments ApplyConf adds; MakeArguments puts them before args.txt's.
+std::vector<std::string>& ConfArguments() {
+  static std::vector<std::string> args;
+  return args;
 }
 
 // What the desktop launcher (installer/launcher.cpp, Prepare) sets from
@@ -231,6 +240,16 @@ void ApplyConf(const std::filesystem::path& conf_path) {
     if (!is("debug_vertex_trace", "false")) env("XERENGE_VERTEX_TRACE", "1");
     if (is("debug_constant_trace", "true")) env("XERENGE_CONSTANT_TRACE", "1");
     if (has("debug_video_gpu")) env("XERENGE_VIDEO_GPU", get("debug_video_gpu"));
+  }
+  // The launcher's arguments from the conf (Prepare's end): the gamertag, and
+  // online play. There is no installer here to turn it on (its Network tab),
+  // so on the Xbox it is on unless the conf says online = false: this copy
+  // runs its own lobby and finds the others on the LAN, or uses lobby_server.
+  if (has("gamertag")) ConfArguments().push_back("--gamertag=" + get("gamertag"));
+  if (has("lobby_server") || !is("online", "false")) {
+    ConfArguments().push_back("--online");
+    ConfArguments().push_back("--online_fake_lobby=false");
+    if (has("lobby_server")) ConfArguments().push_back("--lobby_server=" + get("lobby_server"));
   }
 }
 
