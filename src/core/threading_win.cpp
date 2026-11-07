@@ -428,45 +428,38 @@ void ProfileSampler() {
     const HANDLE target = g_profile_target.load();
     if (target && SuspendThread(target) != DWORD(-1)) {
       uint64_t sampled_rip = 0, sampled_caller = 0;
+      // Only kernel calls while the thread is paused: its registers and a copy
+      // of the top of its stack. Unwinding there took the function-table lock,
+      // which the paused thread could hold, and the game froze.
+      static uint64_t stack_copy[512];
+      SIZE_T stack_got = 0;
       CONTEXT context = {};
       context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
       if (GetThreadContext(target, &context)) {
-        // The first frame in the title's own code (burnout.exe), unwound from the
-        // sample: the guest function a wait or a helper is reached from.
-        uint64_t caller = 0;
-        {
-          // The executable's address range, read once: nothing that takes the
-          // loader lock while the thread is paused.
-          static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
-          static const uint64_t exe_end = [] {
-            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
-            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + dos->e_lfanew);
-            return exe + nt->OptionalHeader.SizeOfImage;
-          }();
-          CONTEXT walk = context;
-          for (int frame = 0; frame < 24 && walk.Rip; ++frame) {
-            if (walk.Rip >= exe && walk.Rip < exe_end) {
-              caller = walk.Rip;
+        sampled_rip = context.Rip;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Rsp), stack_copy,
+                          sizeof(stack_copy), &stack_got);
+      }
+      ResumeThread(target);
+      // The title's own code (burnout.exe) above the sample: the first return
+      // address into it on the stack - the guest function a wait or a helper is
+      // reached from.
+      if (sampled_rip) {
+        static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        static const uint64_t exe_end = [] {
+          const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+          const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + dos->e_lfanew);
+          return exe + nt->OptionalHeader.SizeOfImage;
+        }();
+        if (sampled_rip < exe || sampled_rip >= exe_end) {
+          for (size_t w = 0; w < stack_got / 8; ++w) {
+            if (stack_copy[w] >= exe && stack_copy[w] < exe_end) {
+              sampled_caller = stack_copy[w];
               break;
             }
-            DWORD64 image = 0;
-            PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(walk.Rip, &image, nullptr);
-            if (!entry) {
-              walk.Rip = *reinterpret_cast<DWORD64*>(walk.Rsp);
-              walk.Rsp += 8;
-              continue;
-            }
-            PVOID handler_data = nullptr;
-            DWORD64 establisher = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data, &establisher, nullptr);
           }
         }
-        sampled_rip = context.Rip;
-        sampled_caller = caller;
       }
-      // Resumed before anything that allocates or locks: the paused thread may
-      // hold the heap's lock, and waiting on it here froze the game for good.
-      ResumeThread(target);
       if (sampled_rip) {
         if (sampled_caller && sampled_caller != sampled_rip) {
           ++callers[sampled_caller];
@@ -559,7 +552,11 @@ void ThreadCpuMonitor() {
         const uint64_t now = ThreadCpu100ns(entry.handle);
         if (now > entry.last) {
           used.emplace_back(now - entry.last, entry.name.empty() ? std::to_string(id) : entry.name);
-          if (now - entry.last > busiest) {
+          // XERENGE_PROFILE_THREAD=<part of a name> keeps the profiler on that
+          // thread; otherwise it follows the busiest.
+          static const char* const wanted = std::getenv("XERENGE_PROFILE_THREAD");
+          const bool named = wanted && *wanted && entry.name.find(wanted) != std::string::npos;
+          if (named || (!(wanted && *wanted) && now - entry.last > busiest)) {
             busiest = now - entry.last;
             g_profile_target.store(entry.handle);
             g_profile_target_name = entry.name;
