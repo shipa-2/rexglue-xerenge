@@ -451,9 +451,20 @@ void ProfileSampler() {
           const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + dos->e_lfanew);
           return exe + nt->OptionalHeader.SizeOfImage;
         }();
-        if (sampled_rip < exe || sampled_rip >= exe_end) {
+        // And the renderer's DLL: for its threads, the plume code above a wait.
+        static const uint64_t plume = reinterpret_cast<uint64_t>(GetModuleHandleW(L"rexgpu-plume.dll"));
+        static const uint64_t plume_end = [] {
+          if (!plume) return uint64_t(0);
+          const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(plume);
+          const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(plume + dos->e_lfanew);
+          return plume + nt->OptionalHeader.SizeOfImage;
+        }();
+        const auto ours = [](uint64_t a) {
+          return (a >= exe && a < exe_end) || (a >= plume && a < plume_end);
+        };
+        if (!ours(sampled_rip)) {
           for (size_t w = 0; w < stack_got / 8; ++w) {
-            if (stack_copy[w] >= exe && stack_copy[w] < exe_end) {
+            if (ours(stack_copy[w])) {
               sampled_caller = stack_copy[w];
               break;
             }
@@ -512,10 +523,18 @@ void ProfileSampler() {
     if (const char* dir = std::getenv("XERENGE_PROFILE_FILE")) {
       if (std::FILE* out = std::fopen(dir, "w")) {
         {
-          static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
-          std::fprintf(out, "## callers in burnout.exe of samples outside it\n");
+          std::fprintf(out, "## callers (title or renderer code) of samples outside them\n");
           for (const auto& [rip, count] : callers) {
-            std::fprintf(out, "%u caller 0x%llX\n", count, (unsigned long long)(rip - exe));
+            HMODULE module = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(rip), &module) && module) {
+              wchar_t path[MAX_PATH] = L"";
+              GetModuleFileNameW(module, path, MAX_PATH);
+              std::wstring file(path);
+              file = file.substr(file.find_last_of(L"\\/") + 1);
+              std::fprintf(out, "%u caller %ls 0x%llX\n", count, file.c_str(),
+                           (unsigned long long)(rip - reinterpret_cast<uint64_t>(module)));
+            }
           }
         }
         for (const auto& [who, thread_hits] : all_hits) {
