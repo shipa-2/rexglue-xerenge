@@ -582,6 +582,17 @@ void ThreadCpuMonitor() {
           }
         }
         entry.last = now;
+        // The freeze watchdog stops early in every run while it only sleeps:
+        // say whether something has suspended it.
+        if (entry.name == "freeze watchdog") {
+          const DWORD suspended = SuspendThread(entry.handle);
+          if (suspended != DWORD(-1)) {
+            ResumeThread(entry.handle);
+            if (suspended != 0) {
+              REXLOG_WARN("freeze watchdog: suspended {} time(s) by someone", suspended);
+            }
+          }
+        }
       }
     }
     std::sort(used.begin(), used.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -872,6 +883,7 @@ void DumpAllThreads(const wchar_t* file) {
 }
 
 void FreezeWatchdog(uint32_t seconds, std::wstring file) {
+  set_current_thread_name("freeze watchdog");
   NoteKnownModules();
   g_captured = new Captured[kMaxThreads];
   g_stacks = new uint8_t[kMaxThreads * kStackCopy];
