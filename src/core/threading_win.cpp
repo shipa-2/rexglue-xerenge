@@ -622,6 +622,48 @@ std::string Frame(uint64_t address) {
   return fmt::format("{}+0x{:X}", name, address - module);
 }
 
+// The last exceptions any thread raised (first chance), for the freeze dump:
+// a thread that vanished leaves its cause here. Lock-free - written from
+// inside the exception - and fixed size.
+struct ExceptionNote {
+  std::atomic<uint32_t> sequence{0};
+  DWORD code = 0, thread = 0;
+  uint64_t address = 0;
+  uint64_t frames[8] = {};
+};
+ExceptionNote g_exception_notes[32];
+std::atomic<uint32_t> g_exception_count{0};
+
+LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
+  const DWORD code = info->ExceptionRecord->ExceptionCode;
+  // Not the debugger's thread names, not the guest's own memory faults in
+  // bulk (the write watch takes thousands): still, a fault is kept - the ring
+  // simply turns over.
+  if (code == 0x406D1388) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  const uint32_t n = g_exception_count.fetch_add(1, std::memory_order_relaxed);
+  ExceptionNote& note = g_exception_notes[n % 32];
+  note.code = code;
+  note.thread = GetCurrentThreadId();
+  note.address = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
+  CONTEXT walk = *info->ContextRecord;
+  for (int i = 0; i < 8; ++i) {
+    note.frames[i] = walk.Rip;
+    DWORD64 image = 0;
+    PRUNTIME_FUNCTION entry = walk.Rip ? RtlLookupFunctionEntry(walk.Rip, &image, nullptr) : nullptr;
+    if (!entry) {
+      break;
+    }
+    PVOID handler_data = nullptr;
+    DWORD64 establisher = 0;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data, &establisher,
+                     nullptr);
+  }
+  note.sequence.store(n + 1, std::memory_order_release);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void DumpAllThreads(const char* file) {
   struct Captured {
     DWORD id;
@@ -692,6 +734,21 @@ void DumpAllThreads(const char* file) {
       std::fprintf(out, "  %s\n", Frame(f).c_str());
     }
   }
+  const uint32_t raised = g_exception_count.load(std::memory_order_acquire);
+  std::fprintf(out, "\nexceptions raised: %u, the last of them:\n", raised);
+  for (uint32_t n = raised > 32 ? raised - 32 : 0; n < raised; ++n) {
+    const ExceptionNote& note = g_exception_notes[n % 32];
+    if (note.sequence.load(std::memory_order_acquire) != n + 1) {
+      continue;
+    }
+    std::fprintf(out, "#%u code %08lX thread %lu at %s\n", n, note.code, note.thread,
+                 Frame(note.address).c_str());
+    for (uint64_t f : note.frames) {
+      if (f) {
+        std::fprintf(out, "    %s\n", Frame(f).c_str());
+      }
+    }
+  }
   std::fclose(out);
 }
 
@@ -734,6 +791,7 @@ void StartFreezeWatchdog() {
   }
   {
     const uint32_t seconds = std::max(2u, uint32_t(std::strtoul(text, nullptr, 10)));
+    AddVectoredExceptionHandler(1, NoteException);
     const char* file = std::getenv("XERENGE_FREEZE_FILE");
     std::thread(FreezeWatchdog, seconds, std::string(file && *file ? file : "freeze.txt")).detach();
   }
