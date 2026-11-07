@@ -91,8 +91,13 @@ static void set_thread_name_impl(HANDLE thread, const std::string_view name) {
   raise_thread_name_exception(thread, std::string(name));
 }
 
+namespace {
+void MonitorCurrentThread(std::string_view name);
+}  // namespace
+
 void set_current_thread_name(const std::string_view name) {
   set_thread_name_impl(GetCurrentThread(), name);
+  MonitorCurrentThread(name);
 }
 
 void MaybeYield() {
@@ -822,6 +827,22 @@ void ThreadCpuName(DWORD id, const std::string& name) {
   if (it != ThreadCpuTable().end()) {
     it->second.name = name;
   }
+}
+// A thread made elsewhere (std::thread: the renderer's workers) that names
+// itself is counted and can be profiled too.
+void MonitorCurrentThread(std::string_view name) {
+  if (!ThreadCpuWanted()) {
+    return;
+  }
+  bool known;
+  {
+    std::lock_guard lock(g_thread_cpu_mutex);
+    known = ThreadCpuTable().count(GetCurrentThreadId()) != 0;
+  }
+  if (!known) {
+    ThreadCpuRegister();
+  }
+  ThreadCpuName(GetCurrentThreadId(), std::string(name));
 }
 }  // namespace
 
