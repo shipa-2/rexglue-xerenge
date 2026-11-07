@@ -561,7 +561,143 @@ void ThreadCpuMonitor() {
     REXLOG_INFO("threads (share of one core over 2 s):{}", line);
   }
 }
+// XERENGE_FREEZE_DUMP=N: when the whole process has used less than 3% of one
+// core for N seconds - a freeze, every thread blocked - each thread's native
+// stack is written to XERENGE_FREEZE_FILE (default freeze.txt here), once.
+// Every thread of the process, not only the ones made here: the renderer's and
+// the driver's are found by trying each thread id. Plain file writes, no
+// logger, which may be the very lock everything waits on.
+uint64_t ProcessCpu100ns() {
+  FILETIME created, exited, kernel, user;
+  if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+    return 0;
+  }
+  return (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+         (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+}
+
+// module+offset of an address, as text.
+std::string Frame(uint64_t address) {
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(address), &module)) {
+    return fmt::format("0x{:X}", address);
+  }
+  wchar_t path[MAX_PATH] = {};
+  GetModuleFileNameW(module, path, MAX_PATH);
+  std::wstring name(path);
+  name = name.substr(name.find_last_of(L"\\/") + 1);
+  return fmt::format("{}+0x{:X}", std::string(name.begin(), name.end()),
+                     address - reinterpret_cast<uint64_t>(module));
+}
+
+void DumpAllThreads(const char* file) {
+  struct Captured {
+    DWORD id;
+    std::string name;
+    std::vector<uint64_t> frames;
+  };
+  std::vector<Captured> threads;
+  const DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
+  for (DWORD id = 4; id < 0x40000; id += 4) {
+    if (id == self) {
+      continue;
+    }
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                          FALSE, id);
+    if (!h) {
+      continue;
+    }
+    if (GetProcessIdOfThread(h) != process) {
+      CloseHandle(h);
+      continue;
+    }
+    Captured c{id, {}, {}};
+    c.frames.reserve(48);
+    if (SuspendThread(h) != DWORD(-1)) {
+      CONTEXT walk = {};
+      walk.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+      if (GetThreadContext(h, &walk)) {
+        for (int frame = 0; frame < 40 && walk.Rip; ++frame) {
+          c.frames.push_back(walk.Rip);
+          DWORD64 image = 0;
+          PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(walk.Rip, &image, nullptr);
+          if (!entry) {
+            walk.Rip = *reinterpret_cast<DWORD64*>(walk.Rsp);
+            walk.Rsp += 8;
+            continue;
+          }
+          PVOID handler_data = nullptr;
+          DWORD64 establisher = 0;
+          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, walk.Rip, entry, &walk, &handler_data,
+                           &establisher, nullptr);
+        }
+      }
+      ResumeThread(h);
+    }
+    PWSTR description = nullptr;
+    if (SUCCEEDED(GetThreadDescription(h, &description)) && description) {
+      std::wstring w(description);
+      c.name.assign(w.begin(), w.end());
+      LocalFree(description);
+    }
+    CloseHandle(h);
+    threads.push_back(std::move(c));
+  }
+  FILE* out = std::fopen(file, "w");
+  if (!out) {
+    return;
+  }
+  std::fprintf(out, "freeze: %zu threads\n", threads.size());
+  for (const auto& c : threads) {
+    std::string name = c.name;
+    {
+      std::lock_guard lock(g_thread_cpu_mutex);
+      auto it = ThreadCpuTable().find(c.id);
+      if (name.empty() && it != ThreadCpuTable().end()) name = it->second.name;
+    }
+    std::fprintf(out, "\nthread %lu '%s'\n", c.id, name.c_str());
+    for (uint64_t f : c.frames) {
+      std::fprintf(out, "  %s\n", Frame(f).c_str());
+    }
+  }
+  std::fclose(out);
+}
+
+void FreezeWatchdog(uint32_t seconds, std::string file) {
+  std::vector<uint64_t> history;
+  for (;;) {
+    ::Sleep(1000);
+    history.push_back(ProcessCpu100ns());
+    if (history.size() <= seconds) {
+      continue;
+    }
+    const uint64_t used = history.back() - history[history.size() - 1 - seconds];
+    // 3% of one core over the window, in 100 ns ticks.
+    if (used < uint64_t(seconds) * 300000) {
+      DumpAllThreads(file.c_str());
+      return;
+    }
+    history.erase(history.begin());
+  }
+}
+
+void StartFreezeWatchdog() {
+  // Asked at every thread's start until it is set: the first threads start
+  // before env.txt is read.
+  static std::atomic<bool> started{false};
+  const char* text = std::getenv("XERENGE_FREEZE_DUMP");
+  if (started.load() || !text || !*text || started.exchange(true)) {
+    return;
+  }
+  {
+    const uint32_t seconds = std::max(2u, uint32_t(std::strtoul(text, nullptr, 10)));
+    const char* file = std::getenv("XERENGE_FREEZE_FILE");
+    std::thread(FreezeWatchdog, seconds, std::string(file && *file ? file : "freeze.txt")).detach();
+  }
+}
 void ThreadCpuRegister() {
+  StartFreezeWatchdog();
   if (!ThreadCpuWanted()) {
     return;
   }
