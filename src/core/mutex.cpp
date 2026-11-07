@@ -18,4 +18,9 @@ std::recursive_mutex& global_critical_region::mutex() {
   return global_mutex;
 }
 
+int& global_critical_region::guest_depth() {
+  thread_local int depth = 0;
+  return depth;
+}
+
 }  // namespace rex::thread

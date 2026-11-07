@@ -57,6 +57,12 @@ class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
 
+  // How many times this thread holds the region for guest code that disabled
+  // interrupts (mtmsrd, REX_ENTER_GLOBAL_LOCK): on the console that stops only
+  // its own core, so a wait for something another thread must do - a guest
+  // spinlock - can let the region go for the while (see the spinlock).
+  static int& guest_depth();
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring

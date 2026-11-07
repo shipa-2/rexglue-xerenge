@@ -1027,6 +1027,17 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
     }
     _mm_pause();
   }
+  // Guest code that disabled interrupts holds the global critical region,
+  // which the write-watch fault handler needs too. Waiting here with it, for a
+  // spinlock whose holder is faulting on a watched page, was a deadlock: the
+  // freezes at the logo, the garage and a race's start. On the console a
+  // disabled-interrupt section stops only its own core, so the region is let
+  // go for the wait and taken back once the spinlock is ours.
+  auto& region = rex::thread::global_critical_region::mutex();
+  const int released = std::max(rex::thread::global_critical_region::guest_depth(), 0);
+  for (int i = 0; i < released; ++i) {
+    region.unlock();
+  }
   g_spinlock_sleepers.fetch_add(1, std::memory_order_seq_cst);
   for (;;) {
     if (rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
@@ -1038,9 +1049,23 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
     }
   }
   g_spinlock_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+  for (int i = 0; i < released; ++i) {
+    region.lock();
+  }
 #else
-  while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
-    rex::thread::MaybeYield();
+  if (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+    // As above: the global critical region is not held while waiting.
+    auto& region = rex::thread::global_critical_region::mutex();
+    const int released = std::max(rex::thread::global_critical_region::guest_depth(), 0);
+    for (int i = 0; i < released; ++i) {
+      region.unlock();
+    }
+    while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+      rex::thread::MaybeYield();
+    }
+    for (int i = 0; i < released; ++i) {
+      region.lock();
+    }
   }
 #endif
   return old_irql;

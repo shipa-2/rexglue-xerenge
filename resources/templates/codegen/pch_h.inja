@@ -324,6 +324,7 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
     rex::thread::global_critical_region::mutex().lock(); \
+    ++rex::thread::global_critical_region::guest_depth(); \
     ppc_global_lock_count_().fetch_add(1);               \
   } while (0)
 
@@ -331,5 +332,6 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
   do {                                                                                    \
     auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+    --rex::thread::global_critical_region::guest_depth();                                  \
     rex::thread::global_critical_region::mutex().unlock();                                \
   } while (0)
