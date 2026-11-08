@@ -1002,27 +1002,31 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
 
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
-#if REX_PLATFORM_WIN32
-// Threads asleep on some guest spinlock: a release wakes sleepers only while
-// there are any, so an uncontended lock costs what it always did.
-static std::atomic<uint32_t> g_spinlock_sleepers{0};
-#endif
+// A thread asleep on a lock marks it in the lock word: bit 0 of the owner's
+// PCR address, which is always clear (the PCR is heap-aligned). The word holds
+// the address byte-swapped, so the guest's bit 0 is the host value's bit 24.
+// Only a release that sees the mark makes the wake call - a global count of
+// sleepers made every release of every lock pay for one while anything slept
+// anywhere, and Burnout's audio engine takes its voice lock hundreds of times
+// a pass.
+static constexpr uint32_t kSpinLockSleeper = 0x01000000u;
 
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
-  assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  assert_true((lock->prcb_of_owner.value & ~kSpinLockSleeper) != self);  // self-deadlock
 #if REX_PLATFORM_WIN32
   // On the console the holder runs at DISPATCH level and nothing preempts it,
   // so the lock is soon free. Here the holder is an ordinary thread that can
   // be descheduled, and SwitchToThread in a loop returns at once: Burnout's
   // audio worker burnt a third of a core in it, spinning on the lock its
   // voice list is kept under. Spin briefly, then sleep on the lock word until
-  // a release wakes it (or 1 ms passes, in case a holder released without
-  // seeing this sleeper).
+  // a release wakes it (or 1 ms passes, in case something cleared the word
+  // without going through the release below).
   for (int spin = 0; spin < 256; ++spin) {
-    if (rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+    if (lock->prcb_of_owner.value == 0 &&
+        rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
       return old_irql;
     }
     _mm_pause();
@@ -1038,17 +1042,24 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   for (int i = 0; i < released; ++i) {
     region.unlock();
   }
-  g_spinlock_sleepers.fetch_add(1, std::memory_order_seq_cst);
+  // Having slept, take the lock with the mark set: others may still be asleep
+  // on it, and the mark makes this thread's release wake them.
   for (;;) {
-    if (rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
+    if (rex::thread::atomic_cas(0u, self | kSpinLockSleeper, &lock->prcb_of_owner.value)) {
       break;
     }
     uint32_t held = lock->prcb_of_owner.value;
-    if (held != 0) {
-      WaitOnAddress(&lock->prcb_of_owner.value, &held, sizeof(held), 1);
+    if (held == 0) {
+      continue;
     }
+    if (!(held & kSpinLockSleeper)) {
+      if (!rex::thread::atomic_cas(held, held | kSpinLockSleeper, &lock->prcb_of_owner.value)) {
+        continue;
+      }
+      held |= kSpinLockSleeper;
+    }
+    WaitOnAddress(&lock->prcb_of_owner.value, &held, sizeof(held), 1);
   }
-  g_spinlock_sleepers.fetch_sub(1, std::memory_order_seq_cst);
   for (int i = 0; i < released; ++i) {
     region.lock();
   }
@@ -1073,12 +1084,15 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
 
 void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql,
                            bool change_irql) {
-  assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
-  rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
 #if REX_PLATFORM_WIN32
-  if (g_spinlock_sleepers.load(std::memory_order_seq_cst) != 0) {
+  const uint32_t held = rex::thread::atomic_exchange(0u, &lock->prcb_of_owner.value);
+  assert_true((held & ~kSpinLockSleeper) == rex::byte_swap(static_cast<uint32_t>(ctx->r13.u64)));
+  if (held & kSpinLockSleeper) {
     WakeByAddressAll(&lock->prcb_of_owner.value);
   }
+#else
+  assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
+  rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
 #endif
   if (change_irql && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
