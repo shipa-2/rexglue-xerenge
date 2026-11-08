@@ -8,6 +8,7 @@
 
 #include <rex/platform.h>
 #include <rex/thread.h>
+#include <rex/thread/mutex.h>
 
 static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
@@ -600,17 +601,6 @@ void ThreadCpuMonitor() {
           }
         }
         entry.last = now;
-        // The freeze watchdog stops early in every run while it only sleeps:
-        // say whether something has suspended it.
-        if (entry.name == "freeze watchdog") {
-          const DWORD suspended = SuspendThread(entry.handle);
-          if (suspended != DWORD(-1)) {
-            ResumeThread(entry.handle);
-            if (suspended != 0) {
-              REXLOG_WARN("freeze watchdog: suspended {} time(s) by someone", suspended);
-            }
-          }
-        }
       }
     }
     std::sort(used.begin(), used.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -822,7 +812,7 @@ void DumpAllThreads(const wchar_t* file) {
         c.rsp = context.Rsp;
         // As much of the stack above rsp as can be read, by the kernel: a
         // fault here would be this thread's, with the other one still paused.
-        for (size_t want = kStackCopy; want >= 4096; want /= 2) {
+        for (size_t want = kStackCopy; want >= 512; want /= 2) {
           SIZE_T got = 0;
           if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(context.Rsp), stack,
                                 want, &got) && got) {
@@ -842,10 +832,36 @@ void DumpAllThreads(const wchar_t* file) {
   out.Text("freeze: ");
   out.Dec(count);
   out.Text(" threads (frames: rip, then return addresses found on the stack)\n");
+  // Who holds the global critical region (guest code with interrupts off,
+  // the dispatch thread, the fault handler): read out of the mutex itself -
+  // MSVC's keeps its owner's thread id (and the depth) after the lock word,
+  // { int type; void* unused; SRWLOCK; long thread; int count } - no lock taken.
+  {
+    const auto* words =
+        reinterpret_cast<const uint32_t*>(&global_critical_region::mutex());
+    out.Text("global critical region: owner thread ");
+    out.Dec(words[6]);
+    out.Text(", held ");
+    out.Dec(words[7]);
+    out.Text(" time(s) (raw");
+    for (int i = 0; i < 8; ++i) {
+      out.Text(" ");
+      out.Hex(words[i]);
+    }
+    out.Text(")\n");
+  }
+  // The names the threads gave themselves, if the table is free to read.
+  std::unique_lock names(g_thread_cpu_mutex, std::try_to_lock);
   for (size_t t = 0; t < count; ++t) {
     const Captured& c = g_captured[t];
     out.Text("\nthread ");
     out.Dec(c.id);
+    if (names.owns_lock()) {
+      if (auto it = ThreadCpuTable().find(c.id); it != ThreadCpuTable().end()) {
+        out.Text(" ");
+        out.Text(it->second.name.c_str());
+      }
+    }
     out.Text("\n  ");
     out.Frame(c.rip);
     out.Text("\n");
