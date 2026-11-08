@@ -147,6 +147,20 @@ extern PPCFuncMapping PPCFuncMappings[];
 #define REX_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================
+// Scalar multiply-add (fmadd and its kin)
+//=============================================================================
+
+// Without an FMA unit (the Xbox One's Jaguar) std::fma is a software routine
+// in the C runtime, much slower than a multiply and an add: the samples
+// Burnout's audio mixer spent in the runtime were mostly there.
+// The vector forms are unfused already.
+#if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
+#define REX_FMA(a, b, c) std::fma(a, b, c)
+#else
+#define REX_FMA(a, b, c) ((a) * (b) + (c))
+#endif
+
+//=============================================================================
 // MMIO
 //=============================================================================
 
