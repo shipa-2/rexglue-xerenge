@@ -766,6 +766,9 @@ if(IS_ARM64)
         ${FFMPEG_DIR}/libavcodec/aarch64/videodsp_init.c
         ${FFMPEG_DIR}/libavcodec/aarch64/pixblockdsp_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/pixblockdsp_neon.S
+        # The WMV3 decoder's MPEG video layer calls these on aarch64.
+        ${FFMPEG_DIR}/libavcodec/aarch64/idctdsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/neon/mpegvideo.c
     )
     target_compile_definitions(libavcodec PRIVATE
         HAVE_NEON=1
