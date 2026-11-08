@@ -971,7 +971,12 @@ void FreezeWatchdog(uint32_t seconds, std::wstring file) {
         continue;
       }
     }
-    if (GetFileAttributesW(trigger.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    // The freeze-now file asks for a dump at any time - but it is looked for
+    // by name, which takes the heap, and with the heap's lock held that
+    // stopped the watchdog before the idle dump could fire. Only while the
+    // heap is not being checked for exactly that kind of freeze.
+    static const bool heap_check = std::getenv("XERENGE_HEAP_CHECK") != nullptr;
+    if (!heap_check && GetFileAttributesW(trigger.c_str()) != INVALID_FILE_ATTRIBUTES) {
       DeleteFileW(trigger.c_str());
       DumpAllThreads(file.c_str());
     }
