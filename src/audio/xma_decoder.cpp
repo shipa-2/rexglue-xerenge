@@ -299,12 +299,12 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
-        if (context.Work()) {
-          context.SignalWorkDone();
-        }
+        context.Work();
       }
     }
-    work_event_->Set();
+    // Nothing is left for the worker: Work() disables the context it decodes.
+    // Waking it anyway, and setting a completion event no one waits on, was
+    // two system calls a kicked voice, many times an audio pass.
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
     // This requests a lock by flagging the context.
