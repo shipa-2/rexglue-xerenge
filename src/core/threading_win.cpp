@@ -110,11 +110,29 @@ void SyncMemory() {
 }
 
 void Sleep(std::chrono::microseconds duration) {
-  if (duration.count() < 100) {
+  if (duration.count() <= 0) {
     MaybeYield();
-  } else {
-    ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+    return;
   }
+  if (duration.count() >= 1000 && duration.count() % 1000 == 0) {
+    ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+    return;
+  }
+  // Shorter than the millisecond Sleep counts in, or not a whole number of
+  // them: a high-resolution timer, for the time asked. Rounded down to a yield
+  // - SwitchToThread, back at once - a title polling with short delays spun a
+  // whole core (Burnout's audio worker on the Xbox One).
+  thread_local HANDLE timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (timer) {
+    LARGE_INTEGER due;
+    due.QuadPart = -int64_t(duration.count()) * 10;  // relative, 100 ns units
+    if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+      WaitForSingleObject(timer, INFINITE);
+      return;
+    }
+  }
+  ::Sleep(static_cast<DWORD>((duration.count() + 999) / 1000));
 }
 
 SleepResult AlertableSleep(std::chrono::microseconds duration) {

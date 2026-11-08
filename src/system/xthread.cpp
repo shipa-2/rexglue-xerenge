@@ -1114,7 +1114,12 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
         return X_STATUS_USER_APC;
     }
   } else {
-    if (timeout_ms == 0) {
+    // Under a millisecond but not zero: that long, not a yield - rounded to a
+    // yield, a title polling with short delays spun a core.
+    const int64_t micros = timeout_ticks < 0 ? -timeout_ticks / 10 : 0;
+    if (timeout_ms == 0 && micros > 0) {
+      rex::thread::Sleep(std::chrono::microseconds(micros));
+    } else if (timeout_ms == 0) {
       if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
         rex::thread::Sleep(std::chrono::microseconds(100));
       } else {
