@@ -1514,6 +1514,8 @@ void Thread::Exit(int exit_code) {
   assert_always();
 }
 
+void SetDebugCheckpoint(const char*) {}
+
 void set_current_thread_name(const std::string_view name) {
 #if defined(__APPLE__)
   pthread_setname_np(std::string(name).c_str());

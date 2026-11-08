@@ -105,6 +105,11 @@ void set_current_thread_id(uint32_t id);
 // Sets the current thread name.
 void set_current_thread_name(const std::string_view name);
 
+// The last point some diagnostic passed (a string with static storage), for the
+// freeze dump to print: XERENGE_HEAP_CHECK's last checkpoint that found the
+// heap whole. Windows only; elsewhere it does nothing.
+void SetDebugCheckpoint(const char* where);
+
 // Yields the current thread to the scheduler. Maybe.
 void MaybeYield();
 

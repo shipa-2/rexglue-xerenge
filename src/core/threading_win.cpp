@@ -96,6 +96,14 @@ namespace {
 void MonitorCurrentThread(std::string_view name);
 }  // namespace
 
+namespace {
+extern std::atomic<const char*> g_debug_checkpoint;
+}  // namespace
+
+void SetDebugCheckpoint(const char* where) {
+  g_debug_checkpoint.store(where, std::memory_order_release);
+}
+
 void set_current_thread_name(const std::string_view name) {
   set_thread_name_impl(GetCurrentThread(), name);
   MonitorCurrentThread(name);
@@ -764,9 +772,26 @@ char* g_text = nullptr;
 // Where the watchdog is, in a file beside the snapshot (freeze-state), so a
 // snapshot that does not come back says at which step it stopped. Kernel
 // calls only, like the snapshot itself.
-std::wstring g_mark_path;
+HANDLE g_mark_file = INVALID_HANDLE_VALUE;
+HANDLE g_dump_file = INVALID_HANDLE_VALUE;
+std::atomic<const char*> g_debug_checkpoint{nullptr};
+
+// The whole of a file opened at the start, replaced: kernel calls on a handle,
+// nothing from the heap.
+void RewriteFile(HANDLE file, const char* data, size_t size) {
+  if (file == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  LARGE_INTEGER zero = {};
+  SetFilePointerEx(file, zero, nullptr, FILE_BEGIN);
+  DWORD written = 0;
+  WriteFile(file, data, DWORD(size), &written, nullptr);
+  SetEndOfFile(file);
+  FlushFileBuffers(file);
+}
+
 void Mark(const char* what, uint64_t n) {
-  if (g_mark_path.empty()) {
+  if (g_mark_file == INVALID_HANDLE_VALUE) {
     return;
   }
   char line[96];
@@ -775,12 +800,7 @@ void Mark(const char* what, uint64_t n) {
   out.Text(" ");
   out.Dec(n);
   out.Text("\n");
-  HANDLE f = CreateFile2(g_mark_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS, nullptr);
-  if (f != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    WriteFile(f, line, DWORD(out.used), &written, nullptr);
-    CloseHandle(f);
-  }
+  RewriteFile(g_mark_file, line, out.used);
 }
 
 void DumpAllThreads(const wchar_t* file) {
@@ -881,6 +901,10 @@ void DumpAllThreads(const wchar_t* file) {
     }
   }
   const uint32_t raised = g_exception_count.load(std::memory_order_acquire);
+  out.Text("\nlast checkpoint passed: ");
+  const char* checkpoint = g_debug_checkpoint.load(std::memory_order_acquire);
+  out.Text(checkpoint ? checkpoint : "(none)");
+  out.Text("\n");
   out.Text("\nexceptions raised: ");
   out.Dec(raised);
   out.Text(", the last of them:\n");
@@ -907,12 +931,9 @@ void DumpAllThreads(const wchar_t* file) {
     }
   }
   Mark("dump: writing", out.used);
-  HANDLE f = CreateFile2(file, GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
-  if (f != INVALID_HANDLE_VALUE) {
-    DWORD written = 0;
-    WriteFile(f, out.data, DWORD(out.used), &written, nullptr);
-    CloseHandle(f);
-  }
+  // Through the handle opened at the start: opening a file by name converts
+  // the path on the process heap, and a freeze can be the heap's lock held.
+  RewriteFile(g_dump_file, out.data, out.used);
   Mark("dump: written", out.used);
 }
 
@@ -923,31 +944,36 @@ void FreezeWatchdog(uint32_t seconds, std::wstring file) {
   g_stacks = new uint8_t[kMaxThreads * kStackCopy];
   g_text = new char[kTextBytes];
   const std::wstring trigger = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-now";
-  g_mark_path = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-state";
+  const std::wstring mark_path = file.substr(0, file.find_last_of(L"\\/") + 1) + L"freeze-state";
+  g_mark_file = CreateFile2(mark_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                            OPEN_ALWAYS, nullptr);
+  g_dump_file = CreateFile2(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                            OPEN_ALWAYS, nullptr);
   uint64_t history[64] = {};
   uint32_t ticks = 0;
   bool dumped_idle = false;
   for (;;) {
     ::Sleep(1000);
-    if (GetFileAttributesW(trigger.c_str()) != INVALID_FILE_ATTRIBUTES) {
-      DeleteFileW(trigger.c_str());
-      DumpAllThreads(file.c_str());
-      continue;
-    }
     history[ticks % 64] = ProcessCpu100ns();
     ++ticks;
     if (ticks % 10 == 0) {
       Mark("watchdog: alive, tick", ticks);
     }
-    if (dumped_idle || ticks <= seconds || seconds >= 64) {
-      continue;
+    // Idle first: it needs only kernel calls. The trigger file is looked
+    // for by name, which takes the heap - the very lock a freeze can hold.
+    if (!dumped_idle && ticks > seconds && seconds < 64) {
+      const uint64_t used = history[(ticks - 1) % 64] - history[(ticks - 1 - seconds) % 64];
+      // 3% of one core over the window, in 100 ns ticks.
+      if (used < uint64_t(seconds) * 300000) {
+        Mark("watchdog: idle, dumping", ticks);
+        DumpAllThreads(file.c_str());
+        dumped_idle = true;
+        continue;
+      }
     }
-    const uint64_t used = history[(ticks - 1) % 64] - history[(ticks - 1 - seconds) % 64];
-    // 3% of one core over the window, in 100 ns ticks.
-    if (used < uint64_t(seconds) * 300000) {
-      Mark("watchdog: idle, dumping", ticks);
+    if (GetFileAttributesW(trigger.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      DeleteFileW(trigger.c_str());
       DumpAllThreads(file.c_str());
-      dumped_idle = true;
     }
   }
 }
