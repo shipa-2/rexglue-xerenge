@@ -117,6 +117,10 @@ struct BuilderContext {
   // register save/restore helpers, which take their frame address in r12 (r11
   // for the vector ones) from the caller.
   bool localizeNonArguments() const;
+  // Before a call whose callee may read r11/r12 as the caller left them (an
+  // indirect call can reach an SEH funclet, which takes its owner's frame in
+  // r12): writes the localized ones back to ctx.
+  void spillNonArgumentsForCall();
 
   /**
    * @brief Get expression for general-purpose register access.

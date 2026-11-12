@@ -57,8 +57,20 @@ bool IsSaveRestoreHelper(const std::string& name) {
 // The save/restore helpers read their frame address from r12 (r11 for the vector
 // ones): kept in a local - zero at entry - the address was lost, and the helper
 // stored the registers near guest address 0. Burnout's race blew up at its start.
+// An SEH funclet (share_registers) takes its owner's frame address in r12: in a
+// local - zero at entry - it worked on a frame near guest address 0, and a
+// __finally that should have let a job library's worker go left it waiting while
+// the title's thread spun for it (Burnout froze in a race on the Xbox One).
 bool BuilderContext::localizeNonArguments() const {
-  return config().nonArgumentRegistersAsLocalVariables && !IsSaveRestoreHelper(fn.name());
+  return config().nonArgumentRegistersAsLocalVariables && !IsSaveRestoreHelper(fn.name()) &&
+         !fn.sharesRegisters();
+}
+
+void BuilderContext::spillNonArgumentsForCall() {
+  if (!localizeNonArguments())
+    return;
+  println("\tctx.r11 = {};", r(11));
+  println("\tctx.r12 = {};", r(12));
 }
 
 std::string BuilderContext::r(size_t index) {
@@ -251,6 +263,8 @@ void BuilderContext::emit_function_call(uint32_t address) {
         return;
       }
 
+      if (targetFn->sharesRegisters())
+        spillNonArgumentsForCall();
       emitCtx.reference(name);
       println("\t{}(ctx, base);", name);
       return;
