@@ -192,11 +192,14 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 void XmaContext::ResetDecoderState() {
   // A freed or re-initialized context is a new logical stream, so the previous
   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
-  // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
-  if (av_context_) {
+  // ff_xmaframes_decoder's flush (wmapro_flush, registered in our FFmpeg) clears
+  // channel[].out and leaves the decoder as a fresh open does. Reopening it
+  // instead rebuilt its MDCT and VLC tables at every reset: Burnout recycles
+  // contexts for each sound, and in a long race the audio worker grew to most of
+  // a core on the Xbox One, slowing the frame with it.
+  if (av_context_ && avcodec_is_open(av_context_)) {
+    avcodec_flush_buffers(av_context_);
+  } else if (av_context_) {
     av_context_->sample_rate = 0;
     av_context_->channels = 0;
   }
