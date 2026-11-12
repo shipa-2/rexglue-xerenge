@@ -113,6 +113,10 @@ struct BuilderContext {
    * False when the function shares registers with an intra-function bl partner.
    */
   bool localizeNonVolatiles() const;
+  // Whether r0, r2, r11, r12, f0 and v32-v63 are kept in locals here: not in the
+  // register save/restore helpers, which take their frame address in r12 (r11
+  // for the vector ones) from the caller.
+  bool localizeNonArguments() const;
 
   /**
    * @brief Get expression for general-purpose register access.

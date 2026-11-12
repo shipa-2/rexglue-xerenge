@@ -48,9 +48,22 @@ bool BuilderContext::localizeNonVolatiles() const {
   return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
 }
 
+namespace {
+bool IsSaveRestoreHelper(const std::string& name) {
+  return name.rfind("__save", 0) == 0 || name.rfind("__rest", 0) == 0;
+}
+}  // namespace
+
+// The save/restore helpers read their frame address from r12 (r11 for the vector
+// ones): kept in a local - zero at entry - the address was lost, and the helper
+// stored the registers near guest address 0. Burnout's race blew up at its start.
+bool BuilderContext::localizeNonArguments() const {
+  return config().nonArgumentRegistersAsLocalVariables && !IsSaveRestoreHelper(fn.name());
+}
+
 std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
+  if ((localizeNonArguments() &&
        (index == 0 || index == 2 || index == 11 || index == 12)) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.r[index] = true;
@@ -61,7 +74,7 @@ std::string BuilderContext::r(size_t index) {
 
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
+  if ((localizeNonArguments() && index == 0) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
@@ -71,7 +84,7 @@ std::string BuilderContext::f(size_t index) {
 
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+  if ((localizeNonArguments() && (index >= 32 && index <= 63)) ||
       (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
@@ -205,6 +218,18 @@ void BuilderContext::emit_function_call(uint32_t address) {
       if (cfg.nonVolatileRegistersAsLocalVariables &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         // print nothing - these are handled by local variable tracking
+        return;
+      }
+
+      // A save/restore helper takes its frame address in r12 (r11 for the vector
+      // ones) through ctx, where it keeps those registers (localizeNonArguments).
+      if (localizeNonArguments() && IsSaveRestoreHelper(name)) {
+        println("\tctx.r11 = {};", r(11));
+        println("\tctx.r12 = {};", r(12));
+        emitCtx.reference(name);
+        println("\t{}(ctx, base);", name);
+        println("\t{} = ctx.r11;", r(11));
+        println("\t{} = ctx.r12;", r(12));
         return;
       }
 
