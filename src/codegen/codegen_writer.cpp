@@ -32,6 +32,7 @@
 #include "codegen_logging.h"
 #include "file_io.h"
 #include "template_registry_internal.h"
+#include "volatile_analysis.h"
 
 namespace {
 
@@ -89,6 +90,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"cr_as_local", cfg.crRegistersAsLocalVariables},
       {"non_argument_as_local", cfg.nonArgumentRegistersAsLocalVariables},
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
+      {"volatile_as_local", cfg.volatileRegistersAsLocalVariables},
   };
 
   return {
@@ -259,6 +261,14 @@ bool CodegenWriter::write(bool force) {
   sizes.reserve(functions.size());
   references.reserve(functions.size());
 
+  // volatile_as_local: every function emitted once to be read, then solved.
+  VolatileAnalysis volatiles;
+  if (config().volatileRegistersAsLocalVariables) {
+    std::vector<const FunctionNode*> analysed(functions.begin(), functions.end());
+    volatiles = AnalyzeVolatiles(analysed, emitCtx);
+    emitCtx.volatiles = &volatiles;
+  }
+
   const size_t maxFileBytes = REXCVAR_GET(max_file_size_bytes);
   std::unordered_set<std::string> referenced;
   emitCtx.referenced = &referenced;
@@ -274,6 +284,7 @@ bool CodegenWriter::write(bool force) {
     references.push_back(referenced);
   }
   emitCtx.referenced = nullptr;
+  emitCtx.volatiles = nullptr;
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);

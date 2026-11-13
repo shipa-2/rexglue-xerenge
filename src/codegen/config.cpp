@@ -13,6 +13,9 @@
 // TOML config file loading
 
 #include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 
@@ -114,6 +117,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_argument_as_local"), "non_argument_as_local");
   MergeBool(cfg.nonVolatileRegistersAsLocalVariables, toml["non_volatile_as_local"].value_or(false),
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
+  MergeBool(cfg.volatileRegistersAsLocalVariables, toml["volatile_as_local"].value_or(false),
+            hasBool("volatile_as_local"), "volatile_as_local");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
   if (hasBool("is_dll")) {
@@ -153,6 +158,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   }
 
   // --- Keyed tables: additive, same key = last wins ---
+
+  // hook_sources: directories whose sources may define hooks (volatile_as_local)
+  if (auto* hookSources = toml["hook_sources"].as_array()) {
+    for (const auto& elem : *hookSources) {
+      if (auto dir = elem.value<std::string>())
+        cfg.hookSources.push_back(*dir);
+    }
+  }
 
   // [rexcrt]
   if (auto* rexcrt = toml["rexcrt"].as_table()) {
@@ -490,12 +503,82 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
 
 }  // namespace
 
+namespace {
+
+// volatile_as_local writes to PPCContext, before a call, only the registers the
+// callee's own code may read. A hook standing in the callee's place reads its
+// arguments as the ABI passes them, whatever the code it replaces did - so the
+// names a project's sources mention (sub_XXXXXXXX, or a function the config
+// names) are taken as possibly hooked, and calls to them pass every argument.
+void ScanHookSources(RecompilerConfig& cfg, const std::filesystem::path& baseDir) {
+  namespace fs = std::filesystem;
+  if (cfg.hookSources.empty())
+    return;
+
+  std::unordered_set<std::string> configNames;
+  for (const auto& [addr, fc] : cfg.functions) {
+    if (!fc.name.empty())
+      configNames.insert(fc.name);
+  }
+
+  auto isIdent = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+  auto isGeneratedName = [](std::string_view s) {
+    if (s.size() != 12 || !s.starts_with("sub_"))
+      return false;
+    return std::all_of(s.begin() + 4, s.end(),
+                       [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
+  };
+
+  std::vector<fs::path> files;
+  for (const auto& dir : cfg.hookSources) {
+    std::error_code ec;
+    for (const auto& entry : fs::recursive_directory_iterator(baseDir / dir, ec)) {
+      if (!entry.is_regular_file())
+        continue;
+      auto ext = entry.path().extension().string();
+      if (ext == ".cpp" || ext == ".h" || ext == ".hpp" || ext == ".cc" || ext == ".c" ||
+          ext == ".inc" || ext == ".cxx")
+        files.push_back(entry.path());
+    }
+    if (ec)
+      REXCODEGEN_WARN("[config] hook_sources: cannot read {}: {}", (baseDir / dir).string(),
+                      ec.message());
+  }
+  std::sort(files.begin(), files.end());
+
+  for (const auto& path : files) {
+    std::ifstream in(path, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    for (size_t i = 0; i < text.size();) {
+      if (!isIdent(text[i]) || std::isdigit(static_cast<unsigned char>(text[i]))) {
+        ++i;
+        continue;
+      }
+      size_t j = i;
+      while (j < text.size() && isIdent(text[j]))
+        ++j;
+      std::string_view token(text.data() + i, j - i);
+      if (token.starts_with("__imp__"))
+        token.remove_prefix(7);
+      if (isGeneratedName(token) || configNames.contains(std::string(token)))
+        cfg.hookedNames.emplace(token);
+      i = j;
+    }
+    cfg.hookSourceFiles.push_back(fs::absolute(path).string());
+  }
+  REXCODEGEN_INFO("[config] hook_sources: {} function name(s) in {} file(s)",
+                  cfg.hookedNames.size(), files.size());
+}
+
+}  // namespace
+
 bool RecompilerConfig::Load(const std::string_view& configFilePath) {
   std::set<std::string> visited;
   std::filesystem::path path(configFilePath);
   if (!LoadRecursive(path, *this, visited, 0)) {
     return false;
   }
+  ScanHookSources(*this, path.parent_path());
   return FinalizeConfig(*this);
 }
 
@@ -505,6 +588,7 @@ bool RecompilerConfig::LoadFromTable(const toml::table& tbl,
   if (!ApplyTableWithIncludes(tbl, base_dir, *this, visited, 0, "<inline>")) {
     return false;
   }
+  ScanHookSources(*this, base_dir);
   return FinalizeConfig(*this);
 }
 

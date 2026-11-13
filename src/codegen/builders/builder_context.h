@@ -98,6 +98,10 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  /// volatile_as_local applies to this function: r3-r10, f1-f13 and v0-v13 are
+  /// locals, and FunctionNode::emitCpp adds what moves between them and ctx.
+  bool localizeVolatiles = false;
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 

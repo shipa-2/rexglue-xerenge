@@ -77,7 +77,8 @@ std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
   if ((localizeNonArguments() &&
        (index == 0 || index == 2 || index == 11 || index == 12)) ||
-      (localizeNonVolatiles() && index >= 14)) {
+      (localizeNonVolatiles() && index >= 14) ||
+      (localizeVolatiles && index >= 3 && index <= 10)) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
   }
@@ -87,7 +88,8 @@ std::string BuilderContext::r(size_t index) {
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
   if ((localizeNonArguments() && index == 0) ||
-      (localizeNonVolatiles() && index >= 14)) {
+      (localizeNonVolatiles() && index >= 14) ||
+      (localizeVolatiles && index >= 1 && index <= 13)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -97,7 +99,8 @@ std::string BuilderContext::f(size_t index) {
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
   if ((localizeNonArguments() && (index >= 32 && index <= 63)) ||
-      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))) ||
+      (localizeVolatiles && index <= 13)) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }

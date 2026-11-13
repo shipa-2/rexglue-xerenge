@@ -96,6 +96,16 @@ struct RecompilerConfig {
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
+  /// r3-r10, f1-f13 and v0-v13 in locals, synchronized with PPCContext around
+  /// calls by a liveness analysis (volatile_analysis.h).
+  bool volatileRegistersAsLocalVariables = false;
+  /// Directories (relative to the config) whose sources may define hooks.
+  std::vector<std::string> hookSources;
+  /// Identifiers found there that can name a recompiled function: a call to one
+  /// of these may reach a hook, which reads its arguments as the ABI passes them.
+  std::unordered_set<std::string> hookedNames;
+  /// The files read for hookedNames (build dependencies).
+  std::vector<std::string> hookSourceFiles;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   // === Analysis tuning (optional) ===

@@ -97,6 +97,19 @@ std::string FingerprintModule(const RecompilerConfig& cfg,
       fmt::format("max_blocks_per_function={}", REXCVAR_GET(max_blocks_per_function)),
   };
 
+  // The hooks' names, not their sources: an edit that adds or drops no hook
+  // leaves the generated code as it is.
+  if (cfg.volatileRegistersAsLocalVariables) {
+    std::vector<std::string> hooked(cfg.hookedNames.begin(), cfg.hookedNames.end());
+    std::sort(hooked.begin(), hooked.end());
+    std::string joined;
+    for (const auto& name : hooked) {
+      joined += name;
+      joined += ',';
+    }
+    flags.push_back(fmt::format("hooked={}", joined));
+  }
+
   return ComputeInputFingerprint(inputs, sdkVersion, flags);
 }
 
@@ -362,6 +375,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
         CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
     fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
     allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
+    for (const auto& hookSource : entry.ctx.Config().hookSourceFiles)
+      allInputs.emplace_back(hookSource);
 
     if (opts.ignoreStamp || opts.force)
       continue;

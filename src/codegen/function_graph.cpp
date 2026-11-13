@@ -27,6 +27,7 @@
 #include <rex/memory/utils.h>
 
 #include "codegen_logging.h"
+#include "volatile_analysis.h"
 
 #include <dis-asm.h>
 #include <ppc.h>
@@ -488,6 +489,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   CSRState csrState = CSRState::Unknown;
   RecompilerLocalVariables localVariables;
 
+  // volatile_as_local: what the analysis found for this function (none in the
+  // analysis pass itself, and for a function that stays on PPCContext).
+  const VolatileFunctionInfo* volatiles = ctx.volatiles ? ctx.volatiles->find(this) : nullptr;
+  uint32_t insnIndex = 0;
+
   // Local map for late-detected jump tables (can't mutate const config)
   std::unordered_map<uint32_t, JumpTable> lateJumpTables;
 
@@ -509,10 +515,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
     while (blockBase < blockEnd) {
       // Only emit each label once
+      bool labelled = false;
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
         csrState = CSRState::Unknown;
+        labelled = true;
       }
+      const size_t insnStart = body.size();
 
       // Look up switch table for this address
       activeJt = nullptr;
@@ -582,6 +591,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         int id = insn.opcode->id;
         BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
                                   localVariables, csrState, activeJt};
+        builderCtx.localizeVolatiles = volatiles != nullptr;
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();
@@ -597,6 +607,17 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           builderCtx.emit_mid_asm_hook();
         }
       }
+
+      if (ctx.insnSink) {
+        ctx.insnSink->insns.push_back(
+            {static_cast<uint32_t>(blockBase), labelled, body.substr(insnStart)});
+      }
+      if (volatiles) {
+        auto actions = volatiles->actions.find(insnIndex);
+        if (actions != volatiles->actions.end())
+          ApplyVolatileActions(body, insnStart, actions->second);
+      }
+      ++insnIndex;
 
       blockBase += 4;
       ++data;
@@ -634,6 +655,9 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "\t\t}} SEH_END");
     emit_println(body, "\t}}\n");
   } else {
+    // The body can run off its end: that is a return too.
+    if (volatiles && volatiles->fallsOffEnd)
+      body += VolatileStores(volatile_regs::kReturns & volatiles->referenced, 1);
     emit_println(body, "}}\n");
   }
 
@@ -651,18 +675,31 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   for (size_t i = 0; i < 32; i++) {
-    if (localVariables.r[i])
-      emit_println(out, "\tPPCRegister r{}{{}};", i);
+    if (localVariables.r[i]) {
+      // A volatile register live at entry starts as the caller left it.
+      if (volatiles && volatile_regs::IsGpr(i) && (volatiles->entryLoad & volatile_regs::Gpr(int(i))))
+        emit_println(out, "\tPPCRegister r{} = ctx.r{};", i, i);
+      else
+        emit_println(out, "\tPPCRegister r{}{{}};", i);
+    }
   }
 
   for (size_t i = 0; i < 32; i++) {
-    if (localVariables.f[i])
-      emit_println(out, "\tPPCRegister f{}{{}};", i);
+    if (localVariables.f[i]) {
+      if (volatiles && volatile_regs::IsFpr(i) && (volatiles->entryLoad & volatile_regs::Fpr(int(i))))
+        emit_println(out, "\tPPCRegister f{} = ctx.f{};", i, i);
+      else
+        emit_println(out, "\tPPCRegister f{}{{}};", i);
+    }
   }
 
   for (size_t i = 0; i < 128; i++) {
-    if (localVariables.v[i])
-      emit_println(out, "\tPPCVRegister v{}{{}};", i);
+    if (localVariables.v[i]) {
+      if (volatiles && volatile_regs::IsVr(i) && (volatiles->entryLoad & volatile_regs::Vr(int(i))))
+        emit_println(out, "\tPPCVRegister v{} = ctx.v{};", i, i);
+      else
+        emit_println(out, "\tPPCVRegister v{}{{}};", i);
+    }
   }
 
   if (localVariables.env)

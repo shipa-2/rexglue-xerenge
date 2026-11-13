@@ -56,6 +56,11 @@ struct EmitContext {
   /// per-file declaration header, so a missed name is a compile error.
   std::unordered_set<std::string>* referenced = nullptr;
 
+  /// volatile_as_local: where the analysis pass collects each instruction's text,
+  /// and, in the emitting pass, what the analysis found (volatile_analysis.h).
+  struct InsnTextSink* insnSink = nullptr;
+  const struct VolatileAnalysis* volatiles = nullptr;
+
   void reference(std::string_view name) const {
     if (referenced)
       referenced->emplace(name);
