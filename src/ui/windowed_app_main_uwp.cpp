@@ -213,6 +213,8 @@ void ApplyConf(const std::filesystem::path& conf_path) {
   // Two of the reflection cube's six faces a frame, skipped in the title itself
   // (rexglue reflection_faces.cpp), so neither the CPU nor the GPU builds them.
   if (is("reflection_split", "true")) env("XERENGE_REFLECTION_FACES", "2");
+  // reflection_faces = 1, 2 or 3: that many of the six a frame, over reflection_split.
+  if (has("reflection_faces")) env("XERENGE_REFLECTION_FACES", get("reflection_faces"));
   if (has("render_resolution")) env("XERENGE_RENDER_RESOLUTION", get("render_resolution"));
   if (is("anisotropy", "off")) {
     env("XERENGE_MAX_ANISOTROPY", "1");
