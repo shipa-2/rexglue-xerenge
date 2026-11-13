@@ -725,7 +725,7 @@ struct ExceptionNote {
   std::atomic<uint32_t> sequence{0};
   DWORD code = 0, thread = 0;
   uint64_t address = 0;
-  uint64_t frames[8] = {};
+  uint64_t frames[16] = {};
 };
 ExceptionNote g_exception_notes[32];
 std::atomic<uint32_t> g_exception_count{0};
@@ -745,7 +745,7 @@ LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
   note.thread = GetCurrentThreadId();
   note.address = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
   CONTEXT walk = *info->ContextRecord;
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 16; ++i) {
     note.frames[i] = walk.Rip;
     DWORD64 image = 0;
     PRUNTIME_FUNCTION entry = walk.Rip ? RtlLookupFunctionEntry(walk.Rip, &image, nullptr) : nullptr;
@@ -759,7 +759,7 @@ LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
   }
   note.sequence.store(n + 1, std::memory_order_release);
   if (g_exception_log != INVALID_HANDLE_VALUE && n < 4000) {
-    char line[320];
+    char line[1600];
     Out out{line, sizeof(line) - 1, 0};
     FILETIME now;
     GetSystemTimeAsFileTime(&now);
@@ -775,8 +775,37 @@ LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
     out.Hex(code);
     out.Text(" thread ");
     out.Dec(note.thread);
-    for (int i = 0; i < 5 && note.frames[i]; ++i) {
+    if (code == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2) {
+      out.Text(info->ExceptionRecord->ExceptionInformation[0] == 0   ? " reading "
+               : info->ExceptionRecord->ExceptionInformation[0] == 8 ? " executing "
+                                                                    : " writing ");
+      out.Hex(info->ExceptionRecord->ExceptionInformation[1]);
+    }
+    for (int i = 0; i < 16 && note.frames[i]; ++i) {
       out.Text(" ");
+      if (ModuleOf(note.frames[i]) == nullptr && n < 64) {
+        // A module loaded after the watchdog started (a driver's): named
+        // through the loader, whose lock the first few lines may risk.
+        HMODULE module = nullptr;
+        wchar_t path[MAX_PATH];
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(note.frames[i]), &module) &&
+            module && GetModuleFileNameW(module, path, MAX_PATH)) {
+          const wchar_t* name = path;
+          for (const wchar_t* p = path; *p; ++p) {
+            if (*p == L'\\' || *p == L'/') name = p + 1;
+          }
+          char narrow[64];
+          int k = 0;
+          for (; name[k] && k < 63; ++k) narrow[k] = char(name[k]);
+          narrow[k] = 0;
+          out.Text(narrow);
+          out.Text("+");
+          out.Hex(note.frames[i] - reinterpret_cast<uint64_t>(module));
+          continue;
+        }
+      }
       out.Frame(note.frames[i]);
     }
     out.Text("\n");
