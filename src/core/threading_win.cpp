@@ -729,6 +729,10 @@ struct ExceptionNote {
 };
 ExceptionNote g_exception_notes[32];
 std::atomic<uint32_t> g_exception_count{0};
+// Every exception as it is raised, a line each, in exceptions.txt beside the
+// freeze file (the first few thousand): what a freeze that pauses the whole
+// process - this watchdog too - was preceded by. Written with WriteFile alone.
+HANDLE g_exception_log = INVALID_HANDLE_VALUE;
 
 LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
   const DWORD code = info->ExceptionRecord->ExceptionCode;
@@ -754,6 +758,31 @@ LONG CALLBACK NoteException(PEXCEPTION_POINTERS info) {
                      nullptr);
   }
   note.sequence.store(n + 1, std::memory_order_release);
+  if (g_exception_log != INVALID_HANDLE_VALUE && n < 4000) {
+    char line[320];
+    Out out{line, sizeof(line) - 1, 0};
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    const uint64_t ms = ((uint64_t(now.dwHighDateTime) << 32 | now.dwLowDateTime) / 10000) % 86400000;
+    out.Dec(ms / 3600000);
+    out.Text(":");
+    out.Dec(ms / 60000 % 60);
+    out.Text(":");
+    out.Dec(ms / 1000 % 60);
+    out.Text(".");
+    out.Dec(ms % 1000);
+    out.Text(" UTC code ");
+    out.Hex(code);
+    out.Text(" thread ");
+    out.Dec(note.thread);
+    for (int i = 0; i < 5 && note.frames[i]; ++i) {
+      out.Text(" ");
+      out.Frame(note.frames[i]);
+    }
+    out.Text("\n");
+    DWORD written = 0;
+    WriteFile(g_exception_log, line, DWORD(out.used), &written, nullptr);
+  }
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -949,6 +978,9 @@ void FreezeWatchdog(uint32_t seconds, std::wstring file) {
                             OPEN_ALWAYS, nullptr);
   g_dump_file = CreateFile2(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
                             OPEN_ALWAYS, nullptr);
+  const std::wstring exceptions_path = file.substr(0, file.find_last_of(L"\\/") + 1) + L"exceptions.txt";
+  g_exception_log = CreateFile2(exceptions_path.c_str(), GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE, CREATE_ALWAYS, nullptr);
   uint64_t history[64] = {};
   uint32_t ticks = 0;
   bool dumped_idle = false;
