@@ -137,6 +137,11 @@ class XmpApp : public system::xam::App {
   void SetActiveDriver(rex::audio::AudioDriver* driver);
 
   State state_;
+  // A pause the title asked for that a hold gate kept from taking effect
+  // (crash/takedown camera music): the music plays on; a continue/stop
+  // discards it, the worker lands it when the hold's window ends.
+  bool pause_held_ = false;
+  uint64_t pause_held_at_ms_ = 0;
   // The state last announced to the title (kMsgStateChanged); only a change
   // from it is broadcast.
   std::atomic<uint32_t> last_announced_state_{0xFFFFFFFFu};

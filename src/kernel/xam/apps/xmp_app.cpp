@@ -56,12 +56,33 @@ namespace xam {
 namespace {
 std::mutex g_song_path_mutex;
 std::function<std::string(const std::string&)> g_song_path_resolver;
+std::mutex g_pause_hold_mutex;
+std::function<bool()> g_pause_hold;
+uint64_t g_pause_hold_timeout_ms = 6000;
 }  // namespace
 
 void SetXmpSongPathResolver(std::function<std::string(const std::string&)> resolver) {
   std::lock_guard<std::mutex> lock(g_song_path_mutex);
   g_song_path_resolver = std::move(resolver);
 }
+
+void SetXmpPauseHold(std::function<bool()> hold_pause, uint64_t timeout_ms) {
+  std::lock_guard<std::mutex> lock(g_pause_hold_mutex);
+  g_pause_hold = std::move(hold_pause);
+  g_pause_hold_timeout_ms = timeout_ms;
+}
+
+namespace {
+uint64_t PauseHoldTimeoutMs() {
+  std::lock_guard<std::mutex> lock(g_pause_hold_mutex);
+  return g_pause_hold_timeout_ms;
+}
+
+bool TakePauseHold() {
+  std::lock_guard<std::mutex> lock(g_pause_hold_mutex);
+  return g_pause_hold && g_pause_hold();
+}
+}  // namespace
 
 namespace {
 std::string ResolveSongPath(const std::string& path) {
@@ -491,6 +512,19 @@ void XmpApp::WorkerThreadMain() {
       resume_fence_.Wait();
       continue;
     }
+    // A held pause whose window ran out with no continue: land it now (a
+    // real pause - the pause menu - rather than a camera's quick one).
+    if (pause_held_ &&
+        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()) >=
+            pause_held_at_ms_ + PauseHoldTimeoutMs()) {
+      pause_held_ = false;
+      state_ = State::kPaused;
+      DiscardActiveDriverFrames();
+      OnStateChanged();
+      continue;
+    }
     while (state_ == State::kPlaying && !IsTitleInPlaybackControl()) {
       resume_fence_.Wait();
     }
@@ -701,6 +735,12 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
 
 X_HRESULT XmpApp::XMPContinue() {
   REXKRNL_INFO("XMP: title continues playback");
+  if (pause_held_) {
+    // The pause this continues was held, never taken: nothing to continue,
+    // and the hold is done (a short camera's stop-and-resume).
+    pause_held_ = false;
+    return X_E_SUCCESS;
+  }
   if (state_ == State::kPaused) {
     state_ = State::kPlaying;
     resume_fence_.Signal();
@@ -712,6 +752,7 @@ X_HRESULT XmpApp::XMPContinue() {
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_INFO("XMP: title stops playback");
+  pause_held_ = false;  // a stop supersedes a held pause
   DiscardActiveDriverFrames();
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
@@ -724,6 +765,16 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
 }
 
 X_HRESULT XmpApp::XMPPause() {
+  if (state_ == State::kPlaying && TakePauseHold()) {
+    // Held, not taken: the music keeps playing. A continue/stop before the
+    // hold expires discards it; the worker lands it when the hold ends.
+    REXKRNL_INFO("XMP: title pause held (music stays on)");
+    pause_held_ = true;
+    pause_held_at_ms_ = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+    return X_E_SUCCESS;
+  }
   REXKRNL_INFO("XMP: title pauses playback");
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
