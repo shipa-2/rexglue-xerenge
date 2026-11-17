@@ -60,6 +60,8 @@ std::function<std::string(const std::string&)> g_song_path_resolver;
 std::mutex g_pause_hold_mutex;
 std::function<bool()> g_pause_hold;
 uint64_t g_pause_hold_timeout_ms = 6000;
+std::mutex g_volume_gate_mutex;
+std::function<bool(float)> g_volume_gate;
 }  // namespace
 
 void SetXmpSongPathResolver(std::function<std::string(const std::string&)> resolver) {
@@ -71,6 +73,11 @@ void SetXmpPauseHold(std::function<bool()> hold_pause, uint64_t timeout_ms) {
   std::lock_guard<std::mutex> lock(g_pause_hold_mutex);
   g_pause_hold = std::move(hold_pause);
   g_pause_hold_timeout_ms = timeout_ms;
+}
+
+void SetXmpVolumeGate(std::function<bool(float)> allow) {
+  std::lock_guard<std::mutex> lock(g_volume_gate_mutex);
+  g_volume_gate = std::move(allow);
 }
 
 namespace {
@@ -926,7 +933,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMP: title sets the volume to {:g}", float(args->value));
-      volume_ = args->value;
+      {
+        std::function<bool(float)> gate;
+        {
+          std::lock_guard<std::mutex> lock(g_volume_gate_mutex);
+          gate = g_volume_gate;
+        }
+        if (!gate || gate(float(args->value))) {
+          volume_ = args->value;
+        }
+      }
       return X_E_SUCCESS;
     }
     case 0x0007000D: {

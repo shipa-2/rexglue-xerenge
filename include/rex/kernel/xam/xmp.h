@@ -15,6 +15,13 @@ namespace rex::kernel::xam {
 // starts, so what it answers may change while the title plays.
 void SetXmpSongPathResolver(std::function<std::string(const std::string&)> resolver);
 
+// A volume the title sets may be refused (return false): the value is not
+// applied and the music keeps its level. crash_music uses it to keep the
+// soundtrack through the crash/takedown mute, which is a fade of this volume
+// to 0 - the fade's low values are refused. (Menus PAUSE the soundtrack, a
+// different path, and are not touched.)
+void SetXmpVolumeGate(std::function<bool(float proposed)> allow);
+
 // A pause the title asks for may be held instead of taken: while held the
 // music keeps playing; a continue/stop/play before the hold expires discards
 // it (a short camera's stop-and-resume), otherwise the pause lands when the
