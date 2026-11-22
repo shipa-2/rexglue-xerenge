@@ -45,18 +45,19 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      auto type = user_profile->type() & type_mask;
-      if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      } else if (type & 1) {
-        // maybe offline profile?
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      }
+    // Local secondary inputs share the primary profile. In particular, the
+    // keyboard can be player 2 for split screen without becoming a signed-out
+    // Xbox profile; the content APIs already use this profile's save_xuid too.
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    auto type = user_profile->type() & type_mask;
+    if (type & (2 | 4)) {
+      // maybe online profile?
+      xuid = user_profile->xuid();
+      result = X_E_SUCCESS;
+    } else if (type & 1) {
+      // maybe offline profile?
+      xuid = user_profile->xuid();
+      result = X_E_SUCCESS;
     }
   } else {
     result = X_E_INVALIDARG;
@@ -71,10 +72,8 @@ constexpr uint32_t kSignedInToLive = 2;
 u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = OnlineStub() ? kSignedInToLive : user_profile->signin_state();
-    }
+    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    signin_state = OnlineStub() ? kSignedInToLive : user_profile->signin_state();
   }
   return signin_state;
 }
@@ -95,7 +94,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (user_index >= 4) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -111,10 +110,6 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
-  }
-
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   REXKRNL_INFO("XamUserGetName(user {}, buffer {:08X}, length {}) -> \"{}\"", user_index,
@@ -126,10 +121,6 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
   if (user_index >= 4) {
     return X_E_INVALIDARG;
-  }
-
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
   }
 
   if (!buffer || buffer_len < 16) {
@@ -216,8 +207,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  if (!xuids && user_index >= 4) {
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
@@ -313,8 +303,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  if (user_index >= 4) {
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -323,7 +312,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_NO_SUCH_USER;
   }
 
-  // Update and save settings.
+  // Update and save settings. Secondary local inputs use the same profile as
+  // the primary one, just as they do for sign-in and content.
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 
   for (uint32_t n = 0; n < setting_count; ++n) {
