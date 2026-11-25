@@ -129,9 +129,6 @@ bool WindowSDL::OpenImpl() {
     REXLOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
     return false;
   }
-  // A game window: the arrow over the picture is a distraction, and the game
-  // has no mouse of its own (issue 104).
-  SDL_HideCursor();
   sdl_window_id_ = SDL_GetWindowID(sdl_window_);
   sdl_app_context().RegisterWindow(sdl_window_id_, this);
 
